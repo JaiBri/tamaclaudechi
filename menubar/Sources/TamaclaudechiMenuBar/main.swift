@@ -257,9 +257,18 @@ struct TamaclaudechiMenuBarApp: App {
             MascotView(viewModel: viewModel, configManager: configManager)
                 .frame(width: 320)
         } label: {
-            // Simple single Image — dynamic squish based on fatigue.
-            // MenuBarExtra's label is extremely restrictive; complex views cause fallback.
-            Image(nsImage: viewModel.menuBarIcon)
+            HStack(spacing: 4) {
+                Image(nsImage: viewModel.menuBarIcon)
+                if let pct = viewModel.sessionUsage {
+                    if let resets = viewModel.sessionResetsIn {
+                        Text("\(pct)% \(resets)")
+                            .monospacedDigit()
+                    } else {
+                        Text("\(pct)%")
+                            .monospacedDigit()
+                    }
+                }
+            }
         }
         .menuBarExtraStyle(.window)
     }
@@ -271,6 +280,8 @@ final class MascotViewModel: ObservableObject {
     @Published var errorMessage: String?
     @Published var lastUpdated: Date?
     @Published private(set) var menuBarIcon: NSImage
+    @Published private(set) var sessionUsage: Int? = nil
+    @Published private(set) var sessionResetsIn: String? = nil
 
     private var originalTemplateImage: NSImage?
     private var timer: Timer?
@@ -280,6 +291,8 @@ final class MascotViewModel: ObservableObject {
     private var stateDirSource: DispatchSourceFileSystemObject?
     private var stateFileDescriptor: CInt = -1
     private var stateDirDescriptor: CInt = -1
+    private var contextFileSource: DispatchSourceFileSystemObject?
+    private var contextFileDescriptor: CInt = -1
 
     init(cliPath: String = MascotPaths.cliExecutable()) {
         self.cliPath = cliPath
@@ -288,6 +301,7 @@ final class MascotViewModel: ObservableObject {
         self.originalTemplateImage = template
         self.menuBarIcon = template ?? NSImage(systemSymbolName: "hare", accessibilityDescription: nil)!
 
+        readContextRemaining()
         Task { await refresh() }
 
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
@@ -298,12 +312,14 @@ final class MascotViewModel: ObservableObject {
         }
 
         configureStateWatchers()
+        startContextFileWatcher()
     }
 
     deinit {
         timer?.invalidate()
         cancelStateFileWatcher()
         cancelStateDirectoryWatcher()
+        cancelContextFileWatcher()
     }
 
     var menuTitle: String {
@@ -334,30 +350,123 @@ final class MascotViewModel: ObservableObject {
     }
 
     private func updateMenuBarIcon() {
-        guard let original = originalTemplateImage, let snapshot = snapshot else { return }
+        guard let original = originalTemplateImage else { return }
+        menuBarIcon = original
+    }
 
-        let rest = Double(snapshot.stats.rest)
-        let energy = Double(snapshot.stats.energy)
-        let fatigue = min(rest, energy) / 100.0  // 0.0=exhausted, 1.0=full
-        let squish = (1.0 - fatigue) * 0.5       // 0.0=no squish, 0.5=max squish
+    private func readContextRemaining() {
+        let path = MascotPaths.contextFile.path
+        guard FileManager.default.fileExists(atPath: path),
+              let data = FileManager.default.contents(atPath: path) else {
+            DispatchQueue.main.async {
+                self.sessionUsage = nil
+                self.sessionResetsIn = nil
+            }
+            return
+        }
+        do {
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let usage = json["usage"] as? [String: Any],
+               let sessionPct = usage["session_pct"] as? Int {
+                let resetsIn = Self.parseResetsCountdown(usage["session_resets"] as? String)
+                DispatchQueue.main.async {
+                    self.sessionUsage = sessionPct
+                    self.sessionResetsIn = resetsIn
+                }
+            } else {
+                DispatchQueue.main.async {
+                    self.sessionUsage = nil
+                    self.sessionResetsIn = nil
+                }
+            }
+        } catch {
+            DispatchQueue.main.async {
+                self.sessionUsage = nil
+                self.sessionResetsIn = nil
+            }
+        }
+    }
 
-        if squish < 0.01 {
-            // No visible squish — use original
-            menuBarIcon = original
+    /// Parse a reset time like "7pm" or "3:30am" into a countdown string like "1h50".
+    /// Returns nil if the string can't be parsed or the reset is not today.
+    private static func parseResetsCountdown(_ raw: String?) -> String? {
+        guard let raw, !raw.isEmpty else { return nil }
+
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+
+        // Try "7pm", "3am", "12pm" etc.
+        for fmt in ["ha", "h:mma"] {
+            formatter.dateFormat = fmt
+            if let time = formatter.date(from: raw.lowercased().trimmingCharacters(in: .whitespaces)) {
+                let calendar = Calendar.current
+                let now = Date()
+                var resetDate = calendar.date(
+                    bySettingHour: calendar.component(.hour, from: time),
+                    minute: calendar.component(.minute, from: time),
+                    second: 0,
+                    of: now
+                )!
+                // If reset time already passed today, it means tomorrow
+                if resetDate <= now {
+                    resetDate = calendar.date(byAdding: .day, value: 1, to: resetDate)!
+                }
+                let diff = Int(resetDate.timeIntervalSince(now))
+                guard diff > 0 else { return nil }
+                let hours = diff / 3600
+                let minutes = (diff % 3600) / 60
+                if hours > 0 {
+                    return String(format: "%dh%02d", hours, minutes)
+                } else {
+                    return "\(minutes)m"
+                }
+            }
+        }
+        return nil
+    }
+
+    private func startContextFileWatcher() {
+        cancelContextFileWatcher()
+        let path = MascotPaths.contextFile.path
+        guard FileManager.default.fileExists(atPath: path) else {
+            // File doesn't exist yet — the directory watcher will pick it up
             return
         }
 
-        let size = original.size
-        let scaleY = 1.0 - squish
-        let newImage = NSImage(size: size, flipped: false) { rect in
-            let drawHeight = size.height * scaleY
-            let drawRect = NSRect(x: 0, y: 0, width: size.width, height: drawHeight)
-            original.draw(in: drawRect, from: NSRect(origin: .zero, size: size),
-                          operation: .sourceOver, fraction: 1.0)
-            return true
+        let descriptor = open(path, O_EVTONLY)
+        guard descriptor >= 0 else { return }
+        contextFileDescriptor = descriptor
+
+        let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: descriptor, eventMask: [.write, .delete, .rename], queue: stateWatchQueue)
+        source.setEventHandler { [weak self, weak source] in
+            guard let self else { return }
+            if let events = source?.data, (events.contains(.delete) || events.contains(.rename)) {
+                self.cancelContextFileWatcher()
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) {
+                    self.startContextFileWatcher()
+                }
+                self.readContextRemaining()
+                return
+            }
+            self.readContextRemaining()
         }
-        newImage.isTemplate = true
-        menuBarIcon = newImage
+        source.setCancelHandler { [weak self] in
+            if let fd = self?.contextFileDescriptor, fd >= 0 {
+                close(fd)
+            }
+            self?.contextFileDescriptor = -1
+        }
+        contextFileSource = source
+        source.resume()
+    }
+
+    private func cancelContextFileWatcher() {
+        contextFileSource?.cancel()
+        contextFileSource = nil
+        if contextFileDescriptor >= 0 {
+            close(contextFileDescriptor)
+            contextFileDescriptor = -1
+        }
     }
 
     private func fetchSnapshot() async throws -> MascotSnapshot {
@@ -438,6 +547,7 @@ final class MascotViewModel: ObservableObject {
         let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: descriptor, eventMask: [.write, .delete, .rename], queue: stateWatchQueue)
         source.setEventHandler { [weak self] in
             self?.startStateFileWatcher()
+            self?.startContextFileWatcher()
         }
         source.setCancelHandler { [weak self] in
             if let fd = self?.stateDirDescriptor, fd >= 0 {
@@ -1204,6 +1314,10 @@ struct MascotPaths {
 
     static var configFile: URL {
         stateDirectory.appendingPathComponent("config.json", isDirectory: false)
+    }
+
+    static var contextFile: URL {
+        stateDirectory.appendingPathComponent("context.json", isDirectory: false)
     }
 }
 
