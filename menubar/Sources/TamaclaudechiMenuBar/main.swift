@@ -1161,16 +1161,16 @@ struct MascotPaths {
         }
 
         // 2. Resolve from running binary location
-        //    Binary is at .app/Contents/MacOS/TamagotchiMenuBar
-        //    Repo structure: menubar/build/TamagotchiMenuBar.app/Contents/MacOS/
-        //    So go up 5 levels to reach repo root, then into scripts/tamagotchi
+        //    Binary is at menubar/build/TamaclaudechiMenuBar.app/Contents/MacOS/TamaclaudechiMenuBar
+        //    So go up 6 levels to reach repo root, then into scripts/tamagotchi
         if let execURL = Bundle.main.executableURL {
             let repoRoot = execURL
                 .deletingLastPathComponent() // MacOS/
                 .deletingLastPathComponent() // Contents/
-                .deletingLastPathComponent() // TamagotchiMenuBar.app/
+                .deletingLastPathComponent() // TamaclaudechiMenuBar.app/
                 .deletingLastPathComponent() // build/
                 .deletingLastPathComponent() // menubar/
+                .deletingLastPathComponent() // → repo root
             let candidate = repoRoot.appendingPathComponent("scripts/tamagotchi").path
             if fm.isExecutableFile(atPath: candidate) {
                 return candidate
