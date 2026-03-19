@@ -1596,14 +1596,14 @@ cmd_usage() {
   [ "$duration" -lt 4 ] && duration=4
   [ "$duration" -gt 10 ] && duration=10
 
-  # Fire toast with cooldown (300s) — dashboard always prints
+  # Fire toast with cooldown (1800s / 30min) — dashboard always prints
   local cooldown_file="${STATE_DIR}/.system-toast-cooldown"
   local can_toast=true
   if [ -f "$cooldown_file" ]; then
     local last_ts now_ts
     last_ts=$(cat "$cooldown_file")
     now_ts=$(date +%s)
-    [ $(( now_ts - last_ts )) -lt 300 ] && can_toast=false
+    [ $(( now_ts - last_ts )) -lt 1800 ] && can_toast=false
   fi
   if [ "$can_toast" = true ]; then
     local toast_script="${BASH_SOURCE[0]%/*}/toast"

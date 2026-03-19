@@ -792,8 +792,8 @@ if [ -n "$_system_alerts" ]; then
     fi
   done
 
-  # Fire toast if new alerts appeared and cooldown (300s) has elapsed
-  if [ -n "$_new_alerts" ] && [ "$_cooldown_elapsed" -gt 300 ]; then
+  # Fire toast if new alerts appeared and cooldown (1800s / 30min) has elapsed
+  if [ -n "$_new_alerts" ] && [ "$_cooldown_elapsed" -gt 1800 ]; then
     # Read mood from state.json
     _toast_mood="NEUTRAL"
     if [ -f "${CONTEXT_DIR}/state.json" ]; then
