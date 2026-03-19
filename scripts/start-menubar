@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Launches TamaclaudechiMenuBar.app if not already running.
+# Builds it first if the .app bundle doesn't exist.
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
+APP_PATH="$REPO_DIR/menubar/build/TamaclaudechiMenuBar.app"
+
+# Already running?
+if pgrep -f TamaclaudechiMenuBar >/dev/null 2>&1; then
+  exit 0
+fi
+
+# Build if needed
+if [ ! -d "$APP_PATH" ]; then
+  "$REPO_DIR/menubar/build-app.sh" "$APP_PATH" >/dev/null 2>&1 || exit 1
+fi
+
+# Launch
+open "$APP_PATH"

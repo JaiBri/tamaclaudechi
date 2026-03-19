@@ -1,0 +1,836 @@
+#!/usr/bin/env bash
+# ──────────────────────────────────────────────────────────────
+# Claude Code Status Line → Tamaclaudchi Context Monitor
+#
+# This script is invoked by Claude Code's statusLine feature.
+# It receives JSON on stdin after every assistant message, extracts
+# context window metrics, persists them to disk for the menu bar
+# companion, and outputs a one-line status for the terminal.
+#
+# Install: add to ~/.claude/settings.json (user-level):
+#   "statusLine": { "type": "command", "command": "/path/to/mascot/scripts/statusline" }
+# ──────────────────────────────────────────────────────────────
+set -euo pipefail
+
+CONTEXT_DIR="${HOME}/.config/claude-mascot"
+CONTEXT_FILE="${CONTEXT_DIR}/context.json"
+
+# Read JSON from stdin
+INPUT=$(cat)
+
+# Extract fields using perl (matching tamagotchi script pattern — no jq dependency)
+remaining=$(echo "$INPUT" | perl -ne 'print $1 if /"remaining_percentage"\s*:\s*(-?[0-9.]+)/' || echo "")
+used=$(echo "$INPUT" | perl -ne 'print $1 if /"used_percentage"\s*:\s*(-?[0-9.]+)/' || echo "")
+session_id=$(echo "$INPUT" | perl -ne 'print $1 if /"session_id"\s*:\s*"([^"]*)"/' || echo "")
+
+# If we couldn't extract context data, pass through silently
+if [ -z "$remaining" ] && [ -z "$used" ]; then
+  exit 0
+fi
+
+# Default missing values
+remaining=${remaining:-0}
+used=${used:-0}
+
+# Round to integers (perl may give floats)
+remaining=$(printf '%.0f' "$remaining")
+used=$(printf '%.0f' "$used")
+
+# Timestamp
+updated_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# Ensure directory exists
+mkdir -p "$CONTEXT_DIR"
+
+# ANSI color codes (ANSI-C quoting so escapes are real bytes)
+ESC=$'\033'
+GREEN="${ESC}[32m"
+RED="${ESC}[31m"
+DARK_RED="${ESC}[38;5;88m"
+ORANGE="${ESC}[38;5;208m"
+YELLOW="${ESC}[33m"
+MAGENTA="${ESC}[35m"
+BOLD="${ESC}[1m"
+DIM="${ESC}[2m"
+RESET="${ESC}[0m"
+
+# ── Helpers ──────────────────────────────────────────────────
+
+# Compact large numbers: 15000→15k, 1200→1.2k, 800→800
+compact_num() {
+  local n=$1
+  if [ "$n" -ge 10000 ]; then
+    echo "$((n / 1000))k"
+  elif [ "$n" -ge 1000 ]; then
+    # One decimal place: 1200→1.2k
+    local whole=$((n / 1000))
+    local frac=$(( (n % 1000) / 100 ))
+    if [ "$frac" -eq 0 ]; then
+      echo "${whole}k"
+    else
+      echo "${whole}.${frac}k"
+    fi
+  else
+    echo "$n"
+  fi
+}
+
+# ── Git section ─────────────────────────────────────────────
+
+git_section() {
+  # Guard: are we inside a git repo?
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return
+  fi
+
+  local git_dir
+  git_dir=$(git rev-parse --git-dir 2>/dev/null)
+
+  # -- Core parse: branch, ahead/behind, staged/unstaged/untracked/conflicts --
+  local branch="" ahead=0 behind=0 staged=0 unstaged=0 untracked=0 conflicts=0
+  local detached=false has_commits=true
+
+  local status_output
+  status_output=$(git status --porcelain=v2 --branch 2>/dev/null) || true
+
+  # Check for fresh repo (no commits yet)
+  if echo "$status_output" | grep -q "^# branch.oid (initial)"; then
+    has_commits=false
+  fi
+
+  # Parse with a single perl pass
+  eval "$(echo "$status_output" | perl -e '
+    my ($br, $ah, $bh, $st, $us, $ut, $cf) = ("", 0, 0, 0, 0, 0, 0);
+    while (<STDIN>) {
+      if (/^# branch\.head (.+)/) {
+        $br = $1;
+      } elsif (/^# branch\.ab \+(\d+) -(\d+)/) {
+        ($ah, $bh) = ($1, $2);
+      } elsif (/^[12] (.)(.)/) {
+        my ($x, $y) = ($1, $2);
+        if ($x eq "U" || $y eq "U" || ($x eq "A" && $y eq "A") || ($x eq "D" && $y eq "D")) {
+          $cf++;
+        } else {
+          $st++ if $x ne ".";
+          $us++ if $y ne ".";
+        }
+      } elsif (/^u /) {
+        $cf++;
+      } elsif (/^\? /) {
+        $ut++;
+      }
+    }
+    print "branch=\"$br\" ahead=$ah behind=$bh staged=$st unstaged=$us untracked=$ut conflicts=$cf\n";
+  ')"
+
+  # Handle detached HEAD
+  if [ "$branch" = "(detached)" ]; then
+    detached=true
+    branch="@$(git rev-parse --short HEAD 2>/dev/null || echo '???')"
+  fi
+
+  # Handle fresh repo
+  if [ "$has_commits" = false ]; then
+    branch="(init)"
+  fi
+
+  # Truncate branch name to 20 chars
+  if [ "${#branch}" -gt 20 ]; then
+    branch="${branch:0:20}…"
+  fi
+
+  # -- Operation state --
+  local operation=""
+  if [ -d "${git_dir}/rebase-merge" ] || [ -d "${git_dir}/rebase-apply" ]; then
+    operation="REBASING"
+  elif [ -f "${git_dir}/MERGE_HEAD" ]; then
+    operation="MERGING"
+  elif [ -f "${git_dir}/CHERRY_PICK_HEAD" ]; then
+    operation="PICKING"
+  elif [ -f "${git_dir}/BISECT_LOG" ]; then
+    operation="BISECTING"
+  fi
+
+  # -- Diff stats (only when dirty) --
+  local diff_add=0 diff_del=0
+  local is_dirty=false
+  if [ "$staged" -gt 0 ] || [ "$unstaged" -gt 0 ] || [ "$conflicts" -gt 0 ]; then
+    is_dirty=true
+  fi
+
+  if [ "$is_dirty" = true ] && [ "$has_commits" = true ]; then
+    eval "$(git diff HEAD --numstat 2>/dev/null | perl -e '
+      my ($a, $d) = (0, 0);
+      while (<STDIN>) {
+        my @f = split /\t/;
+        next if $f[0] eq "-";  # binary files
+        $a += $f[0];
+        $d += $f[1];
+      }
+      print "diff_add=$a diff_del=$d\n";
+    ')"
+  fi
+
+  # -- Stash count --
+  local stash=0
+  stash=$(git stash list 2>/dev/null | wc -l | tr -d ' ')
+
+  # -- Branch counts (cached 30s) --
+  local branches=0 unmerged=0
+  local repo_hash
+  repo_hash=$(echo "$PWD" | perl -MDigest::MD5=md5_hex -ne 'chomp; print md5_hex($_)')
+  local cache_file="${CONTEXT_DIR}/.git-branches-${repo_hash}"
+  local cache_age=999
+
+  if [ -f "$cache_file" ]; then
+    local now
+    now=$(date +%s)
+    local mtime
+    mtime=$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null || echo 0)
+    cache_age=$(( now - mtime ))
+  fi
+
+  if [ "$cache_age" -le 30 ] && [ -f "$cache_file" ]; then
+    eval "$(cat "$cache_file")"
+  else
+    branches=$(git for-each-ref refs/heads/ --format='x' 2>/dev/null | wc -l | tr -d ' ')
+    # Check for unmerged branches — only if a main/master branch exists
+    local main_branch=""
+    if git show-ref --verify --quiet refs/heads/main 2>/dev/null; then
+      main_branch="main"
+    elif git show-ref --verify --quiet refs/heads/master 2>/dev/null; then
+      main_branch="master"
+    fi
+    if [ -n "$main_branch" ]; then
+      unmerged=$(git branch --no-merged "$main_branch" 2>/dev/null | wc -l | tr -d ' ')
+    fi
+    echo "branches=$branches unmerged=$unmerged" > "$cache_file"
+  fi
+
+  # -- Assemble output --
+  local out="🌿 "
+
+  # Branch name (red if detached, white otherwise)
+  if [ "$detached" = true ]; then
+    out="${out}${RED}${branch}${RESET}"
+  else
+    out="${out}${branch}"
+  fi
+
+  # Operation state
+  if [ -n "$operation" ]; then
+    out="${out}  ${MAGENTA}🔀 ${operation}${RESET}"
+  fi
+
+  # Clean check — everything zero and no operation
+  local is_clean=true
+  if [ "$staged" -gt 0 ] || [ "$unstaged" -gt 0 ] || [ "$untracked" -gt 0 ] || \
+     [ "$conflicts" -gt 0 ] || [ "$ahead" -gt 0 ] || [ "$behind" -gt 0 ] || \
+     [ -n "$operation" ]; then
+    is_clean=false
+  fi
+
+  if [ "$is_clean" = true ]; then
+    out="${out} ${GREEN}✅${RESET}"
+  else
+    # Push/pull
+    [ "$ahead" -gt 0 ]    && out="${out}  ${GREEN}⬆ ${ahead} push${RESET}"
+    [ "$behind" -gt 0 ]   && out="${out}  ${RED}⬇ ${behind} pull${RESET}"
+
+    # Conflicts (highest priority problem)
+    [ "$conflicts" -gt 0 ] && out="${out}  ${RED}${BOLD}💥 ${conflicts} conflicts${RESET}"
+
+    # File states
+    [ "$staged" -gt 0 ]    && out="${out}  ${GREEN}✏️ ${staged} staged${RESET}"
+    [ "$unstaged" -gt 0 ]  && out="${out}  ${YELLOW}📝 ${unstaged} changed${RESET}"
+    [ "$untracked" -gt 0 ] && out="${out}  ${DIM}📄 ${untracked} new${RESET}"
+
+    # Diff lines
+    if [ "$diff_add" -gt 0 ] || [ "$diff_del" -gt 0 ]; then
+      out="${out}  ${GREEN}+$(compact_num $diff_add)${RESET} ${RED}−$(compact_num $diff_del)${RESET}"
+    fi
+  fi
+
+  # Stash (shown regardless of clean/dirty)
+  [ "$stash" -gt 0 ]   && out="${out}  ${DIM}📦 ${stash} stash${RESET}"
+
+  # Unmerged branches (shown regardless of clean/dirty)
+  [ "$unmerged" -gt 0 ] && out="${out}  ${YELLOW}⚠️ ${unmerged} unmerged${RESET}"
+
+  # Export for context.json
+  _git_branch="$branch"
+  _git_ahead="$ahead"
+  _git_behind="$behind"
+  _git_staged="$staged"
+  _git_unstaged="$unstaged"
+  _git_untracked="$untracked"
+  _git_conflicts="$conflicts"
+  _git_stash="$stash"
+  _git_diff_add="$diff_add"
+  _git_diff_del="$diff_del"
+  _git_branches="$branches"
+  _git_unmerged="$unmerged"
+  _git_operation="$operation"
+
+  git="$out"
+}
+
+# ── Usage section ──────────────────────────────────────────
+
+usage_section() {
+  local usage_file="${CONTEXT_DIR}/usage.json"
+  [ ! -f "$usage_file" ] && return
+
+  # Staleness check: skip if > 15 min old
+  local now mtime
+  now=$(date +%s)
+  mtime=$(stat -f %m "$usage_file" 2>/dev/null || stat -c %Y "$usage_file" 2>/dev/null || echo 0)
+  [ $(( now - mtime )) -gt 900 ] && return
+
+  # Parse fields with perl (single pass) — includes countdown computation
+  eval "$(perl -e '
+    use POSIX qw(mktime);
+    my %vals;
+    open my $fh, "<", $ARGV[0] or exit;
+    while (<$fh>) {
+      $vals{session_pct}     = $1 if /"session_pct"\s*:\s*(\d+)/;
+      $vals{sess_elapsed}    = $1 if /"session_elapsed_pct"\s*:\s*(\d+)/;
+      $vals{week_pct}        = $1 if /"week_all_pct"\s*:\s*(\d+)/;
+      $vals{week_elapsed}    = $1 if /"week_all_elapsed_pct"\s*:\s*(\d+)/;
+      $vals{extra_spent}     = $1 if /"extra_spent"\s*:\s*([0-9.]+)/;
+      $vals{extra_budget}    = $1 if /"extra_budget"\s*:\s*([0-9.]+)/;
+      $vals{sess_resets}     = $1 if /"session_resets"\s*:\s*"([^"]*)"/;
+      $vals{week_resets}     = $1 if /"week_all_resets"\s*:\s*"([^"]*)"/;
+      $vals{scraped_at}      = $1 if /"scraped_at"\s*:\s*"([^"]*)"/;
+    }
+    close $fh;
+
+    # Print basic vars
+    for my $k (qw(session_pct sess_elapsed week_pct week_elapsed extra_spent extra_budget scraped_at)) {
+      my $prefix = {session_pct=>"u_sess_pct", sess_elapsed=>"u_sess_elapsed",
+                    week_pct=>"u_week_pct", week_elapsed=>"u_week_elapsed",
+                    extra_spent=>"u_extra_spent", extra_budget=>"u_extra_budget",
+                    scraped_at=>"u_scraped_at"}->{$k};
+      if (defined $vals{$k}) {
+        my $v = $vals{$k};
+        $v = "\"$v\"" if $k eq "scraped_at";
+        print "$prefix=$v\n";
+      }
+    }
+    for my $k (qw(sess_resets week_resets)) {
+      my $prefix = $k eq "sess_resets" ? "u_sess_resets" : "u_week_resets";
+      print "$prefix=\"$vals{$k}\"\n" if defined $vals{$k};
+    }
+
+    # Compute countdowns
+    my $now = time();
+
+    # Helper: format seconds as compact countdown
+    sub fmt_countdown {
+      my $secs = shift;
+      return "" if $secs <= 0;
+      my $d = int($secs / 86400);
+      my $h = int(($secs % 86400) / 3600);
+      my $m = int(($secs % 3600) / 60);
+      if ($d > 0) { return "${d}d${h}h" }
+      elsif ($h > 0) { return "${h}h${m}m" }
+      else { return "${m}m" }
+    }
+
+    # Session countdown: parse "1:59pm" or "2pm"
+    if (defined $vals{sess_resets} && $vals{sess_resets} =~ /^(\d+)(?::(\d+))?(am|pm)$/i) {
+      my ($h, $m, $ampm) = ($1, $2 // 0, lc($3));
+      $h = $h % 12;
+      $h += 12 if $ampm eq "pm";
+      my @lt = localtime($now);
+      my $reset = mktime(0, $m, $h, $lt[3], $lt[4], $lt[5]);
+      $reset += 86400 if $reset < $now;
+      my $cd = fmt_countdown($reset - $now);
+      print "u_sess_countdown=\"$cd\"\n" if $cd;
+    }
+
+    # Week countdown: parse "Mar 23 at 10am" or "Mar 23 at 9:59am"
+    if (defined $vals{week_resets} && $vals{week_resets} =~ /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d+)\s+at\s+(\d+)(?::(\d+))?(am|pm)$/i) {
+      my %months = (Jan=>0,Feb=>1,Mar=>2,Apr=>3,May=>4,Jun=>5,Jul=>6,Aug=>7,Sep=>8,Oct=>9,Nov=>10,Dec=>11);
+      my ($mon, $day, $h, $m, $ampm) = ($1, $2, $3, $4 // 0, lc($5));
+      $h = $h % 12;
+      $h += 12 if $ampm eq "pm";
+      my @lt = localtime($now);
+      my $reset = mktime(0, $m, $h, $day, $months{$mon}, $lt[5]);
+      $reset = mktime(0, $m, $h, $day, $months{$mon}, $lt[5]+1) if $reset < $now;
+      my $cd = fmt_countdown($reset - $now);
+      print "u_week_countdown=\"$cd\"\n" if $cd;
+    }
+  ' "$usage_file")"
+
+  # Need at least one percentage to show anything
+  [ -z "${u_sess_pct:-}" ] && [ -z "${u_week_pct:-}" ] && return
+
+  # Pace delta display: usage_pct - elapsed_pct
+  # Positive = ahead (burning fast, chill) → yellow/red
+  # Negative = behind (room to spare, prompt more) → green
+  pace_delta_display() {
+    local usage_pct=$1 elapsed_pct=${2:-}
+
+    # No elapsed data or elapsed is 0 → skip delta
+    if [ -z "$elapsed_pct" ] || [ "$elapsed_pct" -eq 0 ]; then
+      echo ""
+      return
+    fi
+
+    local delta=$(( usage_pct - elapsed_pct ))
+    local color="" sign=""
+
+    if [ "$delta" -le -10 ]; then
+      color="$GREEN"                    # well behind pace — lots of room, prompt more
+    elif [ "$delta" -ge 25 ]; then
+      color="$RED"; sign="+"            # way ahead — chill out
+    elif [ "$delta" -ge 10 ]; then
+      color="$YELLOW"; sign="+"         # ahead — ease off a bit
+    else
+      color="$DIM"
+      [ "$delta" -gt 0 ] && sign="+"
+    fi
+
+    echo "${color}(${sign}${delta})${RESET}"
+  }
+
+  local out="📊 "
+  local parts=()
+
+  if [ -n "${u_week_pct:-}" ]; then
+    local wpc="" wdelta wcd=""
+    [ "$u_week_pct" -gt 90 ] && wpc="$RED"
+    wdelta=$(pace_delta_display "$u_week_pct" "${u_week_elapsed:-}")
+    [ -n "${u_week_countdown:-}" ] && wcd=" ${DIM}⟳${u_week_countdown}${RESET}"
+    parts+=("${wpc}${u_week_pct}%${RESET} week${wdelta}${wcd}")
+  fi
+
+  if [ -n "${u_sess_pct:-}" ]; then
+    local spc="" sdelta scd=""
+    [ "$u_sess_pct" -gt 90 ] && spc="$RED"
+    sdelta=$(pace_delta_display "$u_sess_pct" "${u_sess_elapsed:-}")
+    [ -n "${u_sess_countdown:-}" ] && scd=" ${DIM}⟳${u_sess_countdown}${RESET}"
+    parts+=("${spc}${u_sess_pct}%${RESET} sess${sdelta}${scd}")
+  fi
+
+  # Join parts with " · "
+  local joined=""
+  for i in "${!parts[@]}"; do
+    [ "$i" -gt 0 ] && joined="${joined} · "
+    joined="${joined}${parts[$i]}"
+  done
+
+  # Compute pace deltas for context.json
+  _usage_session_pace_delta=""
+  if [ -n "${u_sess_pct:-}" ] && [ -n "${u_sess_elapsed:-}" ] && [ "${u_sess_elapsed}" -gt 0 ]; then
+    _usage_session_pace_delta=$(( u_sess_pct - u_sess_elapsed ))
+  fi
+  _usage_week_pace_delta=""
+  if [ -n "${u_week_pct:-}" ] && [ -n "${u_week_elapsed:-}" ] && [ "${u_week_elapsed}" -gt 0 ]; then
+    _usage_week_pace_delta=$(( u_week_pct - u_week_elapsed ))
+  fi
+
+  # Export for context.json
+  _usage_session_pct="${u_sess_pct:-}"
+  _usage_session_elapsed="${u_sess_elapsed:-}"
+  _usage_session_resets="${u_sess_resets:-}"
+  _usage_week_pct="${u_week_pct:-}"
+  _usage_week_elapsed="${u_week_elapsed:-}"
+  _usage_week_resets="${u_week_resets:-}"
+  _usage_extra_spent="${u_extra_spent:-}"
+  _usage_extra_budget="${u_extra_budget:-}"
+  _usage_scraped_at="${u_scraped_at:-}"
+
+  usage="${out}${joined}"
+}
+
+# ── System resources section ───────────────────────────────
+
+system_section() {
+  local system_file="${CONTEXT_DIR}/system.json"
+  [ ! -f "$system_file" ] && return
+
+  # Staleness: hide if > 2 min old; trigger background refresh if > 30s old
+  local now mtime age
+  now=$(date +%s)
+  mtime=$(stat -f %m "$system_file" 2>/dev/null || stat -c %Y "$system_file" 2>/dev/null || echo 0)
+  age=$(( now - mtime ))
+  [ "$age" -gt 120 ] && return
+
+  # Trigger background refresh if stale (>30s)
+  if [ "$age" -gt 30 ]; then
+    local monitor="${BASH_SOURCE[0]%/*}/system-monitor"
+    if [ -x "$monitor" ]; then
+      "$monitor" >/dev/null 2>&1 &
+      disown
+    fi
+  fi
+
+  # Parse with perl (single pass)
+  eval "$(perl -e '
+    open my $fh, "<", $ARGV[0] or exit;
+    my $json = do { local $/; <$fh> };
+    close $fh;
+
+    my ($cpu, $ram, $disk, $gpu, $swap, $swap_pct) = (0, 0, 0, "null", 0, 0);
+    my $alerts = "[]";
+    my $top_cpu_name = "";
+    my $top_ram_name = "";
+
+    $cpu      = $1 if $json =~ /"cpu_pct"\s*:\s*(\d+)/;
+    $ram      = $1 if $json =~ /"ram_pct"\s*:\s*(\d+)/;
+    $disk     = $1 if $json =~ /"disk_pct"\s*:\s*(\d+)/;
+    $swap     = $1 if $json =~ /"swap_used_gb"\s*:\s*([0-9.]+)/;
+    $swap_pct = $1 if $json =~ /"swap_pct"\s*:\s*(\d+)/;
+    $gpu      = $1 if $json =~ /"gpu_pct"\s*:\s*(\d+)/;
+    # gpu might be null
+    if ($json =~ /"gpu_pct"\s*:\s*null/) { $gpu = "null"; }
+
+    # Extract alerts array
+    if ($json =~ /"alerts"\s*:\s*\[([^\]]*)\]/) {
+      my $inner = $1;
+      my @a;
+      while ($inner =~ /"(\w+)"/g) { push @a, $1; }
+      $alerts = join(",", @a);
+    }
+
+    # Top CPU process name (first in array)
+    if ($json =~ /"top_cpu"\s*:\s*\[.*?"name"\s*:\s*"([^"]+)"/s) {
+      $top_cpu_name = $1;
+    }
+    # Top RAM process name (first in array)
+    if ($json =~ /"top_ram"\s*:\s*\[.*?"name"\s*:\s*"([^"]+)"/s) {
+      $top_ram_name = $1;
+    }
+
+    print "s_cpu=$cpu\n";
+    print "s_ram=$ram\n";
+    print "s_disk=$disk\n";
+    print "s_swap=$swap\n";
+    print "s_swap_pct=$swap_pct\n";
+    print "s_gpu=$gpu\n";
+    print "s_alerts=\"$alerts\"\n";
+    print "s_top_cpu_name=\"$top_cpu_name\"\n";
+    print "s_top_ram_name=\"$top_ram_name\"\n";
+  ' "$system_file")"
+
+  # Only render when alerts exist
+  [ -z "$s_alerts" ] && return
+
+  # Build display: only show metrics that are alerting
+  local out="🖥️"
+  local IFS=","
+  for alert in $s_alerts; do
+    case "$alert" in
+      cpu)  out="${out} ${RED}CPU ${s_cpu}%${RESET}" ;;
+      ram)  out="${out} ${RED}RAM ${s_ram}%${RESET}" ;;
+      swap) out="${out} ${RED}Swap ${s_swap_pct}%${RESET}" ;;
+      disk) out="${out} ${RED}Disk ${s_disk}%${RESET}" ;;
+      gpu)  out="${out} ${RED}GPU ${s_gpu}%${RESET}" ;;
+    esac
+  done
+  unset IFS
+
+  # Export for context.json
+  _system_cpu="$s_cpu"
+  _system_ram="$s_ram"
+  _system_disk="$s_disk"
+  _system_swap="$s_swap"
+  _system_swap_pct="$s_swap_pct"
+  _system_gpu="$s_gpu"
+  _system_alerts="$s_alerts"
+  _system_top_cpu="$s_top_cpu_name"
+  _system_top_ram="$s_top_ram_name"
+
+  system="$out"
+}
+
+# ── Session files section ──────────────────────────────────
+
+session_files_section() {
+  # Guard: need git and a session_id
+  [ -z "$session_id" ] && return
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return
+
+  local baseline_file="${CONTEXT_DIR}/.session-baseline-${session_id}"
+
+  # Current dirty files: tracked changes + untracked
+  local current_files
+  current_files=$({ git diff --name-only HEAD 2>/dev/null; git status --porcelain 2>/dev/null | perl -ne 'print "$1\n" if /^\?\? (.+)$/'; } | sort -u)
+
+  # First invocation: save baseline and return
+  if [ ! -f "$baseline_file" ]; then
+    echo "$current_files" > "$baseline_file"
+    return
+  fi
+
+  # Set difference: current - baseline = session files
+  local session_only
+  session_only=$(comm -23 <(echo "$current_files") <(sort -u "$baseline_file"))
+
+  [ -z "$session_only" ] && return
+
+  local count
+  count=$(echo "$session_only" | wc -l | tr -d ' ')
+
+  # Extract basenames (max 3)
+  local names=()
+  local i=0
+  while IFS= read -r f; do
+    [ $i -ge 3 ] && break
+    names+=("$(basename "$f")")
+    i=$((i + 1))
+  done <<< "$session_only"
+
+  local joined=""
+  for j in "${!names[@]}"; do
+    [ "$j" -gt 0 ] && joined="${joined}, "
+    joined="${joined}${names[$j]}"
+  done
+
+  local suffix=""
+  if [ "$count" -gt 3 ]; then
+    suffix=" ${DIM}+$((count - 3)) more${RESET}"
+  fi
+
+  local label="files"
+  [ "$count" -eq 1 ] && label="file"
+
+  # Export for context.json
+  _session_files_count="$count"
+  _session_files_names="$joined"
+
+  session_files="📂 ${count} ${label}  ·  ${joined}${suffix}"
+}
+
+# Run git section
+git=""
+_git_branch="" _git_ahead=0 _git_behind=0 _git_staged=0 _git_unstaged=0
+_git_untracked=0 _git_conflicts=0 _git_stash=0 _git_diff_add=0 _git_diff_del=0
+_git_branches=0 _git_unmerged=0 _git_operation=""
+git_section
+
+# Run usage section
+usage=""
+_usage_session_pct="" _usage_session_elapsed="" _usage_session_resets=""
+_usage_week_pct="" _usage_week_elapsed="" _usage_week_resets=""
+_usage_extra_spent="" _usage_extra_budget="" _usage_scraped_at=""
+usage_section
+
+# Run system section
+system=""
+_system_cpu=0 _system_ram=0 _system_disk=0 _system_swap=0 _system_swap_pct=0 _system_gpu="null"
+_system_alerts="" _system_top_cpu="" _system_top_ram=""
+system_section
+
+# Run session files section
+session_files=""
+_session_files_count=0
+_session_files_names=""
+session_files_section
+
+# Write context file atomically (write to temp, then move)
+tmp_file=$(mktemp "${CONTEXT_DIR}/.context.XXXXXX")
+cat > "$tmp_file" <<ENDJSON
+{
+  "remaining": ${remaining},
+  "used": ${used},
+  "session_id": "${session_id}",
+  "updated_at": "${updated_at}",
+  "git": {
+    "branch": "${_git_branch}",
+    "ahead": ${_git_ahead},
+    "behind": ${_git_behind},
+    "staged": ${_git_staged},
+    "unstaged": ${_git_unstaged},
+    "untracked": ${_git_untracked},
+    "conflicts": ${_git_conflicts},
+    "stash": ${_git_stash},
+    "diff_add": ${_git_diff_add},
+    "diff_del": ${_git_diff_del},
+    "branches": ${_git_branches},
+    "unmerged": ${_git_unmerged},
+    "operation": "${_git_operation}"
+  },
+  "usage": {
+    "session_pct": ${_usage_session_pct:-null},
+    "session_elapsed_pct": ${_usage_session_elapsed:-null},
+    "session_resets": $([ -n "$_usage_session_resets" ] && echo "\"$_usage_session_resets\"" || echo null),
+    "week_all_pct": ${_usage_week_pct:-null},
+    "week_all_elapsed_pct": ${_usage_week_elapsed:-null},
+    "week_all_resets": $([ -n "$_usage_week_resets" ] && echo "\"$_usage_week_resets\"" || echo null),
+    "extra_spent": ${_usage_extra_spent:-null},
+    "extra_budget": ${_usage_extra_budget:-null},
+    "session_pace_delta": ${_usage_session_pace_delta:-null},
+    "week_pace_delta": ${_usage_week_pace_delta:-null},
+    "scraped_at": $([ -n "$_usage_scraped_at" ] && echo "\"$_usage_scraped_at\"" || echo null)
+  },
+  "session_files": {
+    "count": ${_session_files_count},
+    "names": $([ -n "$_session_files_names" ] && echo "\"$_session_files_names\"" || echo null)
+  },
+  "system": {
+    "cpu_pct": ${_system_cpu},
+    "ram_pct": ${_system_ram},
+    "disk_pct": ${_system_disk},
+    "gpu_pct": $([ "$_system_gpu" != "null" ] && [ -n "$_system_gpu" ] && echo "$_system_gpu" || echo null),
+    "swap_pct": ${_system_swap_pct},
+    "swap_used_gb": ${_system_swap},
+    "alerts": $(if [ -n "$_system_alerts" ]; then echo "$_system_alerts" | perl -e '$l=<STDIN>;chomp $l;my @a=split/,/,$l;print "[".join(",",map{"\"$_\""}@a)."]"'; else echo "[]"; fi),
+    "top_cpu_process": $([ -n "$_system_top_cpu" ] && echo "\"$_system_top_cpu\"" || echo null),
+    "top_ram_process": $([ -n "$_system_top_ram" ] && echo "\"$_system_top_ram\"" || echo null)
+  }
+}
+ENDJSON
+mv -f "$tmp_file" "$CONTEXT_FILE"
+
+# OSC 8 hyperlink wrappers
+LINK_ON="${ESC}]8;;"    # followed by URL then LINK_SEP
+LINK_SEP="${ESC}\\"     # ends the URL, label text follows
+LINK_OFF="${ESC}]8;;${ESC}\\"  # closes the hyperlink
+
+# Check if Vite dev server is running on port 5173
+if lsof -i :5173 -sTCP:LISTEN >/dev/null 2>&1; then
+  vite="${LINK_ON}http://localhost:5173${LINK_SEP}${GREEN}● dev${RESET}${LINK_OFF}"
+else
+  vite="${RED}○${DIM} dev${RESET}"
+fi
+
+# Check if cloudflared tunnel is running — grab tunnel URL if available
+if pgrep -qf "cloudflared tunnel"; then
+  TUNNEL_URL=""
+  metrics_port=$(lsof -i -sTCP:LISTEN -P 2>/dev/null | grep cloudflared | grep -oE ':[0-9]+' | head -1 | tr -d ':' || true)
+  if [ -n "$metrics_port" ]; then
+    TUNNEL_URL=$(curl -s "http://127.0.0.1:${metrics_port}/quicktunnel" 2>/dev/null | perl -ne 'print $1 if /"hostname"\s*:\s*"([^"]*)"/' || true)
+  fi
+  if [ -n "$TUNNEL_URL" ]; then
+    cf="${LINK_ON}https://${TUNNEL_URL}${LINK_SEP}${GREEN}● tunnel${RESET}${LINK_OFF}"
+  else
+    cf="${GREEN}● tunnel${RESET}"
+  fi
+else
+  cf="${RED}○${DIM} tunnel${RESET}"
+fi
+
+# Output status line for Claude Code's terminal
+# Color thresholds: 90-80% remaining → orange, <80% → red, <70% → dark red
+if [ "$remaining" -lt 70 ]; then
+  brain="${DARK_RED}🧠 ${remaining}%${RESET}"
+elif [ "$remaining" -lt 80 ]; then
+  brain="${RED}🧠 ${remaining}%${RESET}"
+elif [ "$remaining" -lt 90 ]; then
+  brain="${ORANGE}🧠 ${remaining}%${RESET}"
+else
+  brain="🧠 ${remaining}%"
+fi
+
+# Terminal width for wrapping
+term_width=$(tput cols 2>/dev/null || echo 80)
+
+# Measure visible width (strip ANSI escapes + OSC hyperlinks)
+visible_len() {
+  printf '%s' "$1" | perl -pe 's/\e\]8;[^\e]*\e\\//g; s/\e\[[0-9;]*m//g' | wc -m | tr -d ' '
+}
+
+# Collect sections into array
+parts=("${brain}")
+[ -n "$usage" ] && parts+=("${usage}")
+parts+=("${vite}")
+parts+=("${cf}")
+[ -n "$system" ] && parts+=("${system}")
+[ -n "$git" ] && parts+=("${git}")
+
+# Build lines, wrapping at section boundaries when overflow
+line=""
+sep=""
+for part in "${parts[@]}"; do
+  candidate="${line}${sep}${part}"
+  if [ -n "$line" ] && [ "$(visible_len "$candidate")" -gt "$term_width" ]; then
+    echo "$line"
+    line="${part}"
+  else
+    line="$candidate"
+  fi
+  sep="  │  "
+done
+[ -n "$line" ] && echo "$line"
+
+[ -n "$session_files" ] && echo "$session_files"
+
+# ── Background usage scraper trigger ─────────────────────────
+# Spawn scraper if cache is stale (>5 min) or missing
+usage_file="${CONTEXT_DIR}/usage.json"
+if [ ! -f "$usage_file" ] || [ $(( $(date +%s) - $(stat -f %m "$usage_file" 2>/dev/null || echo 0) )) -gt 300 ]; then
+  scraper="${BASH_SOURCE[0]%/*}/usage-scraper"
+  if [ -x "$scraper" ]; then
+    "$scraper" >/dev/null 2>&1 &
+    disown
+  fi
+fi
+
+# ── System alert toast trigger ────────────────────────────────
+# Fire toast when new alerts appear (with 5-min cooldown per alert)
+if [ -n "$_system_alerts" ]; then
+  _last_alert_file="${CONTEXT_DIR}/.system-last-alert"
+  _prev_alerts=""
+  _prev_ts=0
+  if [ -f "$_last_alert_file" ]; then
+    _prev_alerts=$(head -1 "$_last_alert_file" 2>/dev/null || true)
+    _prev_ts=$(tail -1 "$_last_alert_file" 2>/dev/null || echo 0)
+  fi
+
+  _now_ts=$(date +%s)
+  _cooldown_elapsed=$(( _now_ts - _prev_ts ))
+  _new_alerts=""
+
+  # Find alerts not in previous set
+  IFS="," read -ra _cur_arr <<< "$_system_alerts"
+  for _ca in "${_cur_arr[@]}"; do
+    if ! echo ",$_prev_alerts," | grep -q ",$_ca,"; then
+      _new_alerts="${_new_alerts:+${_new_alerts},}${_ca}"
+    fi
+  done
+
+  # Fire toast if new alerts appeared and cooldown (300s) has elapsed
+  if [ -n "$_new_alerts" ] && [ "$_cooldown_elapsed" -gt 300 ]; then
+    # Read mood from state.json
+    _toast_mood="NEUTRAL"
+    if [ -f "${CONTEXT_DIR}/state.json" ]; then
+      _toast_mood=$(perl -ne 'print $1 if /"currentMood"\s*:\s*"([^"]*)"/' "${CONTEXT_DIR}/state.json" 2>/dev/null || echo "NEUTRAL")
+    fi
+    [ -z "$_toast_mood" ] && _toast_mood="NEUTRAL"
+
+    # Build short alert message
+    _toast_msg=""
+    for _ca in "${_cur_arr[@]}"; do
+      case "$_ca" in
+        cpu)  _toast_msg="${_toast_msg}CPU ${_system_cpu}% " ;;
+        ram)  _toast_msg="${_toast_msg}RAM ${_system_ram}% " ;;
+        swap) _toast_msg="${_toast_msg}Swap ${_system_swap_pct}% " ;;
+        disk) _toast_msg="${_toast_msg}Disk ${_system_disk}% " ;;
+        gpu)  _toast_msg="${_toast_msg}GPU ${_system_gpu}% " ;;
+      esac
+    done
+    _toast_msg="${_toast_msg}— ${_system_top_cpu:-something} is hungry"
+
+    # Dynamic duration: ~15 chars/sec reading speed, clamped 4–10s
+    _toast_len=${#_toast_msg}
+    _toast_dur=$(( _toast_len / 15 ))
+    [ "$_toast_dur" -lt 4 ] && _toast_dur=4
+    [ "$_toast_dur" -gt 10 ] && _toast_dur=10
+
+    _toast_script="${BASH_SOURCE[0]%/*}/toast"
+    if [ -x "$_toast_script" ]; then
+      "$_toast_script" --mode done --mood "$_toast_mood" "$_toast_msg" "$_toast_dur" &
+      disown
+    fi
+
+    # Update last-alert state
+    printf '%s\n%s\n' "$_system_alerts" "$_now_ts" > "$_last_alert_file"
+  fi
+fi
+
+# ── Stale baseline cleanup ───────────────────────────────────
+# Remove session baselines older than 24h (background, fire-and-forget)
+find "$CONTEXT_DIR" -name '.session-baseline-*' -mtime +1 -delete 2>/dev/null &

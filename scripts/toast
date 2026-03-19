@@ -1,0 +1,1362 @@
+#!/bin/bash
+# Speech-bubble toast with Claude pixel mascot — queue-based
+# Usage: toast [--mode permission|done] [--mood MOOD] [--achievement ACH] "message text" [duration_seconds]
+#
+# Enqueues the message and returns immediately.
+# A single background processor plays toasts sequentially.
+
+MODE="done"
+MOOD="NEUTRAL"
+ACHIEVEMENT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --mode) MODE="$2"; shift 2 ;;
+    --mood) MOOD="$2"; shift 2 ;;
+    --achievement) ACHIEVEMENT="$2"; shift 2 ;;
+    *) break ;;
+  esac
+done
+
+MSG="${1:-Hello}"
+DURATION="${2:-3}"
+DURATION_MS=$((DURATION * 1000))
+
+# Resolve script directory for assets
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+VOICES_DIR="$SCRIPT_DIR/../assets/voices"
+
+# --- Queue mechanism ---
+QUEUE_DIR="/tmp/toast-queue"
+PIDFILE="/tmp/toast-processor.pid"
+mkdir -p "$QUEUE_DIR"
+
+# Enqueue: write MODE|MSG|DURATION_MS|MOOD|ACHIEVEMENT to a timestamped file
+echo "${MODE}|${MSG}|${DURATION_MS}|${MOOD}|${ACHIEVEMENT}" > "$QUEUE_DIR/$(date +%s%N)-$$"
+
+# Check if processor is already running
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+  # Processor alive — it will pick up our queued file
+  exit 0
+fi
+
+# Write HTML to temp file
+cat > /tmp/toast.html << 'HTMLEOF'
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    background: transparent;
+    overflow: hidden;
+    font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
+  }
+  .container {
+    position: absolute;
+    bottom: 0;
+    right: 0;
+    left: 0;
+    display: flex;
+    align-items: flex-end;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 12px;
+  }
+  .mascot-wrap {
+    position: relative;
+    flex-shrink: 0;
+    align-self: flex-end;
+    order: 2;
+    cursor: pointer;
+  }
+  .mascot-shadow {
+    position: absolute;
+    bottom: -4px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 40px;
+    height: 8px;
+    background: radial-gradient(ellipse, rgba(0,0,0,0.4) 0%, transparent 70%);
+    border-radius: 50%;
+    animation: shadowSquish 0.6s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+  }
+  .mascot {
+    width: 56px;
+    height: 43px;
+    image-rendering: pixelated;
+    display: block;
+    transform-origin: bottom center;
+    animation: bouncySlideIn 0.6s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+  }
+  .mascot.jiggle {
+    animation: bouncySlideIn 0.6s cubic-bezier(0.34, 1.56, 0.64, 1) forwards, jiggle 0.3s 0.6s ease-in-out;
+  }
+  .mascot.talking {
+    transform: translateX(0);
+    animation: talk 0.12s ease-in-out infinite alternate;
+  }
+  .mascot.exit {
+    animation: spinOut 0.5s ease-in forwards;
+  }
+
+  /* Frosted glass bubble */
+  .bubble {
+    cursor: pointer;
+    position: relative;
+    background: rgba(17, 17, 17, 0.65);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 10px;
+    padding: 10px 14px;
+    max-width: 320px;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.06);
+    order: 1;
+    opacity: 0;
+    transform: scale(0.8);
+    transform-origin: right center;
+    overflow: hidden;
+  }
+  .bubble.show {
+    animation: bubbleIn 0.25s ease-out forwards;
+  }
+  .bubble.hide {
+    animation: bubbleOut 0.2s ease-in forwards;
+  }
+  /* Shimmer sweep on border */
+  .bubble::after {
+    content: '';
+    position: absolute;
+    top: -50%;
+    left: -50%;
+    width: 200%;
+    height: 200%;
+    background: linear-gradient(
+      105deg,
+      transparent 40%,
+      rgba(255,255,255,0.08) 45%,
+      rgba(255,255,255,0.15) 50%,
+      rgba(255,255,255,0.08) 55%,
+      transparent 60%
+    );
+    animation: shimmer 1.5s 0.7s ease-in-out forwards;
+    opacity: 0;
+    pointer-events: none;
+  }
+  /* Speech tail */
+  .bubble-tail {
+    position: absolute;
+    bottom: 10px;
+    right: -7px;
+    width: 0;
+    height: 0;
+    border-top: 6px solid transparent;
+    border-bottom: 6px solid transparent;
+    border-left: 7px solid rgba(17, 17, 17, 0.65);
+  }
+  /* Permission mode amber border pulse */
+  .bubble.permission-pulse {
+    animation: bubbleIn 0.25s ease-out forwards, amberPulse 1.5s 0.3s ease-in-out infinite;
+  }
+
+  .message {
+    color: #4ade80;
+    font-size: 13px;
+    line-height: 1.4;
+    word-wrap: break-word;
+    position: relative;
+    z-index: 1;
+  }
+  /* Word-by-word karaoke */
+  .message .word {
+    display: inline-block;
+    color: rgba(255,255,255,0.2);
+    transition: color 0.2s ease, transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+  .message .word.lit {
+    color: var(--lit-color, #4ade80);
+    text-shadow: 0 0 8px rgba(74, 222, 128, 0.35);
+    transform: scale(1);
+  }
+  .message.permission .word.lit {
+    text-shadow: none;
+  }
+
+  /* Canvas overlay */
+  #confetti {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+    z-index: 10;
+  }
+
+  /* Orbiting question marks for permission */
+  .orbit-q {
+    position: fixed;
+    pointer-events: none;
+    z-index: 10;
+    font-size: 16px;
+    color: rgba(250, 204, 21, 0.8);
+    text-shadow: 0 0 8px rgba(250, 204, 21, 0.25);
+    opacity: 0;
+    animation: orbitFade 2.5s ease-out forwards;
+  }
+  /* Mood particles */
+  .mood-particle {
+    position: fixed;
+    pointer-events: none;
+    z-index: 10;
+    opacity: 0;
+    animation: moodParticleFade 2s ease-out forwards;
+  }
+  .mood-particle.zzz {
+    font-size: 18px;
+    color: #64748b;
+    animation: zzzFloat 2.5s ease-out forwards;
+  }
+  .mood-particle.rain {
+    width: 2px;
+    height: 8px;
+    background: #818cf8;
+    border-radius: 1px;
+    animation: rainFall 1.2s linear forwards;
+  }
+  .mood-particle.tear {
+    font-size: 14px;
+    animation: tearDrop 2s ease-in forwards;
+  }
+  .mood-particle.sparkle {
+    font-size: 12px;
+    color: #22d3ee;
+    animation: sparkleFloat 1.5s ease-out forwards;
+  }
+  .mood-particle.exclaim {
+    font-size: 16px;
+    color: #ef4444;
+    font-weight: bold;
+    text-shadow: 0 0 6px rgba(239, 68, 68, 0.4);
+    animation: orbitFade 2s ease-out forwards;
+  }
+  .mood-particle.heart {
+    font-size: 16px;
+    animation: heartBurst 1.5s ease-out forwards;
+  }
+  .mood-particle.star {
+    font-size: 14px;
+    color: #facc15;
+    animation: sparkleFloat 1.8s ease-out forwards;
+  }
+
+  @keyframes orbitFade {
+    0%   { opacity: 0; }
+    15%  { opacity: 0.85; }
+    85%  { opacity: 0.7; }
+    100% { opacity: 0; }
+  }
+  @keyframes zzzFloat {
+    0%   { opacity: 0; transform: translateY(0) scale(0.5); }
+    20%  { opacity: 0.8; }
+    100% { opacity: 0; transform: translateY(-60px) scale(1.3); }
+  }
+  @keyframes rainFall {
+    0%   { opacity: 0.7; transform: translateY(0); }
+    100% { opacity: 0; transform: translateY(80px); }
+  }
+  @keyframes tearDrop {
+    0%   { opacity: 0; transform: translateY(0); }
+    20%  { opacity: 0.8; }
+    100% { opacity: 0; transform: translateY(40px); }
+  }
+  @keyframes sparkleFloat {
+    0%   { opacity: 0; transform: scale(0.3) rotate(0deg); }
+    30%  { opacity: 1; transform: scale(1.2) rotate(120deg); }
+    100% { opacity: 0; transform: scale(0.5) rotate(360deg) translateY(-30px); }
+  }
+  @keyframes heartBurst {
+    0%   { opacity: 0; transform: scale(0); }
+    30%  { opacity: 1; transform: scale(1.5); }
+    100% { opacity: 0; transform: scale(0.3) translateY(-50px); }
+  }
+  @keyframes moodParticleFade {
+    0%   { opacity: 0; }
+    20%  { opacity: 0.8; }
+    100% { opacity: 0; }
+  }
+  @keyframes stomachWobble {
+    0%, 100% { transform: translateX(0); }
+    25%  { transform: translateX(-3px); }
+    75%  { transform: translateX(3px); }
+  }
+  @keyframes bouncySlideIn {
+    0%   { transform: translateX(80px) scaleY(1); opacity: 0; }
+    100% { transform: translateX(0) scaleY(1); opacity: 1; }
+  }
+  @keyframes shadowSquish {
+    0%   { transform: translateX(-50%) scaleX(0.3); opacity: 0; }
+    60%  { transform: translateX(-50%) scaleX(1.3); opacity: 0.5; }
+    100% { transform: translateX(-50%) scaleX(1); opacity: 1; }
+  }
+  @keyframes jiggle {
+    0% { transform: rotate(0); }
+    20% { transform: rotate(-5deg); }
+    40% { transform: rotate(5deg); }
+    60% { transform: rotate(-3deg); }
+    80% { transform: rotate(3deg); }
+    100% { transform: rotate(0); }
+  }
+  @keyframes bubbleIn {
+    from { opacity: 0; transform: scale(0.8); }
+    to { opacity: 1; transform: scale(1); }
+  }
+  @keyframes bubbleOut {
+    from { opacity: 1; transform: scale(1); }
+    to { opacity: 0; transform: scale(0.8); }
+  }
+  @keyframes shimmer {
+    0%   { transform: translateX(-100%); opacity: 1; }
+    100% { transform: translateX(100%); opacity: 0; }
+  }
+  @keyframes amberPulse {
+    0%, 100% { border-color: rgba(250, 204, 21, 0.15); }
+    50%      { border-color: rgba(250, 204, 21, 0.45); }
+  }
+  @keyframes talk {
+    from { transform: translateY(0); }
+    to { transform: translateY(-2px); }
+  }
+  @keyframes spinOut {
+    0%   { transform: translateY(0) scale(1) rotate(0deg); opacity: 1; }
+    100% { transform: translateY(-60px) scale(0.3) rotate(720deg); opacity: 0; }
+  }
+  @keyframes shadowShrink {
+    0%   { transform: translateX(-50%) scaleX(1); opacity: 1; }
+    100% { transform: translateX(-50%) scaleX(0); opacity: 0; }
+  }
+</style>
+</head>
+<body>
+<canvas id="confetti"></canvas>
+<div class="container" id="toast">
+  <div class="mascot-wrap">
+    <img class="mascot" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAI8AAABuCAMAAAAppbCGAAAAAXNSR0IB2cksfwAAAAlwSFlzAAALEwAACxMBAJqcGAAAAGZQTFRFAAAA24Fo2H9f121M2nZV2XJT2ndY2nVW2nVW13hZ23Va5HhXhVJKZD43k1tLn19Pc0Y7YjUtAAAAglNBPCYfWTUwZj4z2ndY2GlB13BM13hZ2nZV2odu3ZR82XJT3ZN6zmdDz25Ne0EMDwAAACJ0Uk5TAJ258//e/9P////////////////////O//PL2Itg/2b/8IWjis4AAAIrSURBVHic7dl9T+JAEAbw3SlFz4sxalpBz1zu+3+piwn4SozmxKjb3YN2t9JiZpuy1arP8w9kmG5/KVAmixT9ivxoQC3w8IGHDzx84OEDDx94+MDDBx4+8PCBh8/n9ARTSx3kTFEokHzxNTRaJoo2pyyjoydPxzf39O39CuwhmdmC8X1Rlj2k7DOpuvHooV04Nsp70EC4nlhnHXm2Xb989l4g2nIt0Vx04xE/Xb/+R76D9J5xsrnWnXj0LjzwtPe0/Tzfa/oWnngna+6J5dB5HtxtXYXxxEUbEe3YytOj/6gfW/bJ85zsrXH/soVnNKvde+ngNn8sf4cEqaH/B0MP7Ke47B3s3lRbkosGnvj9hurD81oBnkqyrFaApxJ4+MDDBx4+8PCBh08zj6HqAOQdBZtHV5amRp7j2pA0uojNG20tEh1MqyccTRt41hPqHaQszPw8nm1uyWN6th/Vt/26vnm++P7hpoGHDzx84OEDD58v7tHkJkVFdodSkBpUT+l2xcTrXKnijv5PMUeuck3FKZLpSb35pdjcE8n5sa1MhqYbz+t21tFdcRXWBmAhTmUx7yaTsrSYyLvw0H7pOblVNWGZ36bwrMyCbt6FBx544IEHHnjg6dwTaL9lPBP5+JVUPHoxkL7lmVD+0opnfE3FAoGuz0he5Y+nf13lz1kqFrXU1P8gFuKXWnanYuWlSKT5AunV+jjZxvN+gYcPPHzg4QMPH3j4wMOnb57/0+affvsLwgUAAAAASUVORK5CYII=" />
+    <div class="mascot-shadow"></div>
+  </div>
+  <div class="bubble">
+    <span class="bubble-tail"></span>
+    <div class="message" id="msg"></div>
+  </div>
+</div>
+<script>
+  const mascot = document.querySelector('.mascot');
+  const bubble = document.querySelector('.bubble');
+  const msgEl = document.getElementById('msg');
+  let currentMood = 'NEUTRAL';
+
+  // --- Mood config ---
+  const MOOD_CONFIG = {
+    ECSTATIC:  { speed: 200, amplitude: 0.3, bob: 8, sway: 5, tilt: 0, filter: 'brightness(1.15) saturate(1.3)', color: '#4ade80', particles: 'doubleConfetti' },
+    EXCITED:   { speed: 250, amplitude: 0.25, bob: 6, sway: 4, tilt: 0, filter: '', color: '#22d3ee', particles: 'sparkles' },
+    HAPPY:     { speed: 350, amplitude: 0.2, bob: 5, sway: 3, tilt: 0, filter: '', color: '#4ade80', particles: 'confetti' },
+    NEUTRAL:   { speed: 450, amplitude: 0.15, bob: 4, sway: 2, tilt: 0, filter: '', color: '#e2e8f0', particles: 'none' },
+    TIRED:     { speed: 600, amplitude: 0.1, bob: 3, sway: 2, tilt: 3, filter: 'brightness(0.85)', color: '#94a3b8', particles: 'yawn' },
+    SLEEPY:    { speed: 800, amplitude: 0.08, bob: 2, sway: 1.5, tilt: 8, filter: 'brightness(0.7) saturate(0.5)', color: '#64748b', particles: 'zzz' },
+    SLEEPING:  { speed: 1000, amplitude: 0.05, bob: 1, sway: 0.5, tilt: 12, filter: 'brightness(0.5) saturate(0.3)', color: '#475569', particles: 'zzz' },
+    HUNGRY:    { speed: 350, amplitude: 0.2, bob: 5, sway: 3, tilt: 0, filter: '', color: '#fb923c', particles: 'wobble' },
+    STARVING:  { speed: 200, amplitude: 0.3, bob: 6, sway: 5, tilt: 0, filter: 'hue-rotate(-20deg) saturate(1.5)', color: '#ef4444', particles: 'exclaim' },
+    SAD:       { speed: 550, amplitude: 0.12, bob: 3, sway: 2, tilt: 2, filter: 'saturate(0.6) brightness(0.9)', color: '#818cf8', particles: 'rain' },
+    LONELY:    { speed: 700, amplitude: 0.08, bob: 2, sway: 1.5, tilt: 3, filter: 'saturate(0.4) brightness(0.8)', color: '#a78bfa', particles: 'tear' },
+  };
+
+  function getMoodConfig() { return MOOD_CONFIG[currentMood] || MOOD_CONFIG.NEUTRAL; }
+
+  // --- Helpers ---
+  function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  // --- Web Audio API analyser for real volume ---
+  let audioCtx, analyser, freqData;
+  try {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 256;
+    analyser.smoothingTimeConstant = 0.6;
+    freqData = new Uint8Array(analyser.frequencyBinCount);
+    analyser.connect(audioCtx.destination);
+  } catch(e) {}
+
+  function getVolume() {
+    if (!analyser) return 0;
+    analyser.getByteFrequencyData(freqData);
+    let sum = 0;
+    for (let i = 0; i < freqData.length; i++) sum += freqData[i];
+    return sum / (freqData.length * 255); // 0–1
+  }
+
+  // Play a single audio file, routed through analyser
+  function playAudioFile(path) {
+    return new Promise(resolve => {
+      const audio = new Audio('file://' + path);
+      audio.volume = 0.15;
+      if (audioCtx) {
+        try {
+          const src = audioCtx.createMediaElementSource(audio);
+          src.connect(analyser);
+        } catch(e) {}
+      }
+      audio.onended = resolve;
+      audio.onerror = resolve;
+      audio.play().catch(resolve);
+    });
+  }
+
+  // Play all voice lines for a message, return total duration in ms
+  async function playVoiceLines(m) {
+    const voices = m.voices || [];
+    if (voices.length === 0) return 0;
+    if (audioCtx && audioCtx.state === 'suspended') await audioCtx.resume();
+    const t0 = performance.now();
+    for (const v of voices) {
+      await playAudioFile(v);
+    }
+    return performance.now() - t0;
+  }
+
+  // --- Persistent breathing loop (mood-parameterized) ---
+  let breathingActive = false;
+  function startBreathing() {
+    breathingActive = true;
+    // Apply mood CSS filter
+    const mc = getMoodConfig();
+    mascot.style.filter = mc.filter || '';
+    function tick() {
+      if (!breathingActive) return;
+      if (voiceActive) { requestAnimationFrame(tick); return; }
+      const mc = getMoodConfig();
+      const now = performance.now();
+      const breathe = Math.sin(now / mc.speed) * mc.amplitude;
+      const squash = -Math.sin(now / mc.speed) * (mc.amplitude * 0.35);
+      const bob = Math.sin(now / mc.speed) * mc.bob;
+      const sway = Math.sin(now / (mc.speed * 1.4)) * mc.sway;
+      const tilt = mc.tilt;
+      // Hungry: occasional rumble interrupt
+      let rumble = 0;
+      if (currentMood === 'HUNGRY' || currentMood === 'STARVING') {
+        rumble = Math.sin(now / 40) * (Math.sin(now / 800) > 0.7 ? 3 : 0);
+      }
+      mascot.style.transform = `translateY(${bob}px) translateX(${rumble}px) scaleX(${1 + squash}) scaleY(${1 + breathe}) rotate(${sway + tilt}deg)`;
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  }
+  function stopBreathing() { breathingActive = false; }
+
+  // Audio-reactive animation — jumpy, stretchy, alive
+  let voiceActive = false;
+  let voiceStartTime = 0;
+  let voiceEstDur = 3000;
+  function startVoiceReactivity(estDur) {
+    voiceActive = true;
+    voiceStartTime = performance.now();
+    voiceEstDur = estDur || 3000;
+    function tick() {
+      if (!voiceActive) return;
+      const elapsed = performance.now() - voiceStartTime;
+
+      // Try real analyser volume, fall back to simulated
+      let vol = getVolume();
+      if (vol < 0.01) {
+        const t = Math.min(elapsed / voiceEstDur, 1);
+        const envelope = Math.sin(t * Math.PI);
+        const pulse = Math.sin(elapsed / 60) * 0.6 + Math.sin(elapsed / 90) * 0.4;
+        vol = 0.35 + envelope * 0.65 + pulse * 0.35;
+        vol = Math.max(0, Math.min(1, vol));
+      }
+
+      const now = performance.now();
+      // Big stretchy squash & stretch
+      const stretchY = 1 + vol * 0.35;           // up to 1.35x tall
+      const squashX = 1 - vol * 0.12;             // squash wide when stretching tall
+      // Jumpy bounce
+      const bounceY = -Math.abs(Math.sin(now / 45)) * vol * 8;  // up to 8px hop
+      // Snappy rotation jiggle
+      const jiggleRot = Math.sin(now / 55) * vol * 6;  // up to ±6deg
+
+      mascot.style.transform = `translateY(${bounceY}px) scaleX(${squashX}) scaleY(${stretchY}) rotate(${jiggleRot}deg)`;
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  }
+
+  // --- Confetti system with ribbons, circles, stars ---
+  function createParticle(x, y) {
+    const colors = ['#4ade80', '#22d3ee', '#a78bfa', '#fb923c', '#f472b6', '#facc15'];
+    const shapes = ['ribbon', 'circle', 'star', 'square'];
+    return {
+      x, y,
+      vx: (Math.random() - 0.5) * 10,
+      vy: -Math.random() * 7 - 3,
+      size: Math.random() * 5 + 2,
+      color: colors[Math.floor(Math.random() * colors.length)],
+      shape: shapes[Math.floor(Math.random() * shapes.length)],
+      rotation: Math.random() * 360,
+      rotSpeed: (Math.random() - 0.5) * 12,
+      wobble: Math.random() * Math.PI * 2,
+      wobbleSpeed: 0.03 + Math.random() * 0.04,
+      life: 1,
+      drag: 0.98 + Math.random() * 0.015,
+    };
+  }
+
+  function drawParticle(ctx, p) {
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.rotation * Math.PI / 180);
+    ctx.globalAlpha = Math.max(0, p.life);
+    ctx.fillStyle = p.color;
+
+    switch(p.shape) {
+      case 'ribbon':
+        ctx.fillRect(-p.size * 1.5, -p.size * 0.3, p.size * 3, p.size * 0.6);
+        break;
+      case 'circle':
+        ctx.beginPath();
+        ctx.arc(0, 0, p.size * 0.6, 0, Math.PI * 2);
+        ctx.fill();
+        break;
+      case 'star':
+        ctx.beginPath();
+        for (let i = 0; i < 5; i++) {
+          const a = (i * 4 * Math.PI / 5) - Math.PI / 2;
+          const r = i === 0 ? p.size : p.size;
+          ctx[i === 0 ? 'moveTo' : 'lineTo'](Math.cos(a) * r, Math.sin(a) * r);
+          const b = a + 2 * Math.PI / 5;
+          ctx.lineTo(Math.cos(b) * r * 0.4, Math.sin(b) * r * 0.4);
+        }
+        ctx.closePath();
+        ctx.fill();
+        break;
+      default:
+        ctx.fillRect(-p.size / 2, -p.size / 2, p.size, p.size);
+    }
+    ctx.restore();
+  }
+
+  let confettiParticles = [];
+  let confettiRunning = false;
+  let vacuumMode = false;
+  let vacuumTarget = { x: 0, y: 0 };
+
+  function startConfetti() {
+    const canvas = document.getElementById('confetti');
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = window.innerWidth * dpr;
+    canvas.height = window.innerHeight * dpr;
+    ctx.scale(dpr, dpr);
+
+    const ox = window.innerWidth - 40;
+    const oy = window.innerHeight - 50;
+
+    for (let i = 0; i < 40; i++) {
+      confettiParticles.push(createParticle(
+        ox + Math.random() * 30 - 15,
+        oy + Math.random() * 10 - 5
+      ));
+    }
+    setTimeout(() => {
+      for (let i = 0; i < 25; i++) {
+        confettiParticles.push(createParticle(
+          ox + Math.random() * 30 - 15,
+          oy + Math.random() * 10 - 5
+        ));
+      }
+    }, 200);
+
+    if (confettiRunning) return;
+    confettiRunning = true;
+
+    function animate() {
+      ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+      let alive = false;
+      for (const p of confettiParticles) {
+        if (p.life <= 0) continue;
+        alive = true;
+
+        if (vacuumMode) {
+          const dx = vacuumTarget.x - p.x;
+          const dy = vacuumTarget.y - p.y;
+          p.vx += dx * 0.06;
+          p.vy += dy * 0.06;
+          p.vx *= 0.92;
+          p.vy *= 0.92;
+          p.life -= 0.03;
+        } else {
+          p.wobble += p.wobbleSpeed;
+          p.vx += Math.sin(p.wobble) * 0.3;
+          p.vx *= p.drag;
+          p.vy += 0.12;
+          p.life -= 0.008;
+        }
+
+        p.x += p.vx;
+        p.y += p.vy;
+        p.rotation += p.rotSpeed;
+
+        drawParticle(ctx, p);
+      }
+      if (alive) requestAnimationFrame(animate);
+      else confettiRunning = false;
+    }
+    requestAnimationFrame(animate);
+  }
+
+  function startVacuum() {
+    const rect = mascot.getBoundingClientRect();
+    vacuumTarget = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    vacuumMode = true;
+    for (const p of confettiParticles) {
+      if (p.life > 0) p.life = Math.max(p.life, 0.5);
+    }
+  }
+
+  // --- Orbiting question marks (permission mode) ---
+  function spawnOrbitingMarks() {
+    const mascotRect = mascot.getBoundingClientRect();
+    const cx = mascotRect.left + mascotRect.width / 2;
+    const cy = mascotRect.top + mascotRect.height / 2;
+    const radius = 35;
+    const count = 5;
+    let spawned = 0;
+
+    const iv = setInterval(() => {
+      if (spawned >= count) { clearInterval(iv); return; }
+      const q = document.createElement('div');
+      q.className = 'orbit-q';
+      q.textContent = '?';
+      q.style.fontSize = (14 + Math.random() * 10) + 'px';
+      document.body.appendChild(q);
+
+      const baseAngle = (spawned / count) * Math.PI * 2 + Math.random() * 0.5;
+      const startTime = performance.now();
+      const orbitDur = 2500;
+
+      function animateOrbit() {
+        const elapsed = performance.now() - startTime;
+        const t = elapsed / orbitDur;
+        if (t > 1) { q.remove(); return; }
+        const angle = baseAngle + t * Math.PI * 1.5;
+        const r = radius * (1 - t * 0.3);
+        const floatY = -t * 40;
+        q.style.left = (cx + Math.cos(angle) * r - 8) + 'px';
+        q.style.top = (cy + Math.sin(angle) * r + floatY - 8) + 'px';
+        requestAnimationFrame(animateOrbit);
+      }
+      requestAnimationFrame(animateOrbit);
+      spawned++;
+    }, 400);
+  }
+
+  // --- Mood particle systems ---
+  let moodParticleInterval = null;
+  function startMoodParticles() {
+    stopMoodParticles();
+    const mc = getMoodConfig();
+    if (mc.particles === 'none' || mc.particles === 'confetti' || mc.particles === 'doubleConfetti') return;
+
+    const mascotRect = mascot.getBoundingClientRect();
+    const cx = mascotRect.left + mascotRect.width / 2;
+    const cy = mascotRect.top + mascotRect.height / 2;
+
+    function spawn() {
+      const el = document.createElement('div');
+      el.className = 'mood-particle';
+      switch (mc.particles) {
+        case 'zzz':
+          el.classList.add('zzz');
+          el.textContent = 'Z';
+          el.style.left = (cx + (Math.random() - 0.5) * 20) + 'px';
+          el.style.top = (cy - 10) + 'px';
+          el.style.fontSize = (14 + Math.random() * 10) + 'px';
+          break;
+        case 'rain':
+          el.classList.add('rain');
+          el.style.left = (cx + (Math.random() - 0.5) * 50) + 'px';
+          el.style.top = (cy - 5) + 'px';
+          break;
+        case 'tear':
+          el.classList.add('tear');
+          el.textContent = '💧';
+          el.style.left = (cx + (Math.random() > 0.5 ? 8 : -12)) + 'px';
+          el.style.top = (cy + 5) + 'px';
+          break;
+        case 'sparkles':
+          el.classList.add('sparkle');
+          el.textContent = '✦';
+          el.style.left = (cx + (Math.random() - 0.5) * 60) + 'px';
+          el.style.top = (cy + (Math.random() - 0.5) * 40) + 'px';
+          break;
+        case 'exclaim':
+          el.classList.add('exclaim');
+          el.textContent = '!';
+          // Orbit around mascot
+          const angle = Math.random() * Math.PI * 2;
+          const r = 30 + Math.random() * 15;
+          el.style.left = (cx + Math.cos(angle) * r) + 'px';
+          el.style.top = (cy + Math.sin(angle) * r) + 'px';
+          break;
+        case 'yawn':
+          // Subtle bob effect (handled in breathing), just occasional text
+          if (Math.random() > 0.3) return;
+          el.classList.add('zzz');
+          el.textContent = '~';
+          el.style.left = (cx + 15) + 'px';
+          el.style.top = (cy - 5) + 'px';
+          el.style.color = '#94a3b8';
+          break;
+        case 'wobble':
+          // Stomach wobble handled in breathing rumble
+          return;
+      }
+      document.body.appendChild(el);
+      setTimeout(() => el.remove(), 3000);
+    }
+
+    const interval = mc.particles === 'zzz' ? 1200 : mc.particles === 'rain' ? 200 : mc.particles === 'tear' ? 3000 : 800;
+    spawn();
+    moodParticleInterval = setInterval(spawn, interval);
+  }
+  function stopMoodParticles() {
+    if (moodParticleInterval) { clearInterval(moodParticleInterval); moodParticleInterval = null; }
+  }
+
+  // --- Achievement celebration effects ---
+  function celebrateAchievement(name) {
+    const mascotRect = mascot.getBoundingClientRect();
+    const cx = mascotRect.left + mascotRect.width / 2;
+    const cy = mascotRect.top;
+    switch (name) {
+      case 'firstFriend':
+        for (let i = 0; i < 8; i++) {
+          setTimeout(() => {
+            const el = document.createElement('div');
+            el.className = 'mood-particle heart';
+            el.textContent = '❤️';
+            el.style.left = (cx + (Math.random() - 0.5) * 60) + 'px';
+            el.style.top = (cy + (Math.random() - 0.5) * 30) + 'px';
+            document.body.appendChild(el);
+            setTimeout(() => el.remove(), 2000);
+          }, i * 150);
+        }
+        break;
+      case 'nightOwl':
+        for (let i = 0; i < 5; i++) {
+          setTimeout(() => {
+            const el = document.createElement('div');
+            el.className = 'mood-particle sparkle';
+            el.textContent = '🦉';
+            el.style.fontSize = '20px';
+            el.style.left = (cx + (Math.random() - 0.5) * 50) + 'px';
+            el.style.top = (cy + (Math.random() - 0.5) * 30) + 'px';
+            document.body.appendChild(el);
+            setTimeout(() => el.remove(), 2000);
+          }, i * 200);
+        }
+        break;
+      case 'centurion':
+        // Gold confetti — use main confetti but with gold colors
+        startConfetti();
+        setTimeout(startConfetti, 300);
+        break;
+      case 'streakMaster':
+        for (let i = 0; i < 12; i++) {
+          setTimeout(() => {
+            const el = document.createElement('div');
+            el.className = 'mood-particle star';
+            el.textContent = '⭐';
+            el.style.left = (cx + (Math.random() - 0.5) * 80) + 'px';
+            el.style.top = (cy + (Math.random() - 0.5) * 50) + 'px';
+            document.body.appendChild(el);
+            setTimeout(() => el.remove(), 2500);
+          }, i * 100);
+        }
+        break;
+      case 'resurrector':
+        for (let i = 0; i < 6; i++) {
+          setTimeout(() => {
+            const el = document.createElement('div');
+            el.className = 'mood-particle heart';
+            el.textContent = '😭';
+            el.style.fontSize = '18px';
+            el.style.left = (cx + (Math.random() - 0.5) * 40) + 'px';
+            el.style.top = (cy + (Math.random() - 0.5) * 30) + 'px';
+            document.body.appendChild(el);
+            setTimeout(() => el.remove(), 2000);
+          }, i * 200);
+        }
+        break;
+      case 'marathon':
+        startConfetti();
+        for (let i = 0; i < 3; i++) {
+          setTimeout(() => {
+            const el = document.createElement('div');
+            el.className = 'mood-particle sparkle';
+            el.textContent = '🏅';
+            el.style.fontSize = '22px';
+            el.style.left = (cx + (Math.random() - 0.5) * 40) + 'px';
+            el.style.top = (cy - 10) + 'px';
+            document.body.appendChild(el);
+            setTimeout(() => el.remove(), 2500);
+          }, i * 400);
+        }
+        break;
+    }
+  }
+
+  // --- Double-click → pet, Long press → stats HUD ---
+  let pressTimer = null;
+  let lastClickTime = 0;
+  document.querySelector('.mascot-wrap').addEventListener('mousedown', () => {
+    pressTimer = setTimeout(() => {
+      // Long press: show mini stats HUD
+      pressTimer = null;
+      showStatsHUD();
+    }, 1000);
+  });
+  document.querySelector('.mascot-wrap').addEventListener('mouseup', () => {
+    if (pressTimer) {
+      clearTimeout(pressTimer);
+      const now = Date.now();
+      if (now - lastClickTime < 350) {
+        // Double click: pet animation
+        petAnimation();
+      }
+      lastClickTime = now;
+    }
+  });
+  document.querySelector('.mascot-wrap').addEventListener('mouseleave', () => {
+    if (pressTimer) clearTimeout(pressTimer);
+  });
+
+  function petAnimation() {
+    mascot.classList.add('jiggle');
+    // Spawn hearts
+    const rect = mascot.getBoundingClientRect();
+    for (let i = 0; i < 3; i++) {
+      setTimeout(() => {
+        const el = document.createElement('div');
+        el.className = 'mood-particle heart';
+        el.textContent = '💚';
+        el.style.left = (rect.left + rect.width / 2 + (Math.random() - 0.5) * 30) + 'px';
+        el.style.top = (rect.top + (Math.random() - 0.5) * 20) + 'px';
+        document.body.appendChild(el);
+        setTimeout(() => el.remove(), 1500);
+      }, i * 150);
+    }
+    setTimeout(() => mascot.classList.remove('jiggle'), 300);
+  }
+
+  function showStatsHUD() {
+    // Read stats from batch data if available
+    const existing = document.querySelector('.stats-hud');
+    if (existing) { existing.remove(); return; }
+    const hud = document.createElement('div');
+    hud.className = 'stats-hud';
+    hud.style.cssText = 'position:fixed;bottom:70px;right:12px;background:rgba(0,0,0,0.85);border:1px solid rgba(255,255,255,0.15);border-radius:8px;padding:8px 12px;font-family:SF Mono,Menlo,monospace;font-size:11px;color:#e2e8f0;z-index:20;backdrop-filter:blur(8px);';
+    hud.innerHTML = '<div style="color:' + getMoodConfig().color + ';font-weight:bold;margin-bottom:4px;">' + currentMood + '</div><div style="opacity:0.6;font-size:10px;">Double-click to pet</div>';
+    document.body.appendChild(hud);
+    setTimeout(() => { if (hud.parentNode) hud.remove(); }, 3000);
+  }
+
+  // --- Setup message for a single cycle ---
+  function setupMessage(m) {
+    // Set current mood from message
+    currentMood = m.mood || 'NEUTRAL';
+    const mc = getMoodConfig();
+
+    // Update mascot filter for mood
+    mascot.style.filter = mc.filter || '';
+
+    msgEl.innerHTML = '';
+    msgEl.className = 'message';
+    const words = m.msg.split(/(\s+)/);
+    const wordSpans = [];
+    for (const w of words) {
+      const span = document.createElement('span');
+      if (w.trim()) {
+        span.className = 'word';
+        wordSpans.push(span);
+      }
+      span.textContent = w;
+      msgEl.appendChild(span);
+    }
+    if (m.mode === 'permission') {
+      msgEl.classList.add('permission');
+      msgEl.style.setProperty('--lit-color', '#facc15');
+    } else {
+      // Use mood color for lit words
+      msgEl.style.setProperty('--lit-color', mc.color);
+    }
+    return wordSpans;
+  }
+
+  // --- Batch runner ---
+  async function runBatch(messages) {
+    // ENTRANCE (once)
+    // t=0: mascot bouncySlideIn (600ms) — already playing via CSS
+    await delay(600);
+    mascot.classList.add('jiggle');
+    await delay(50);
+    mascot.classList.remove('jiggle');
+    // Kill base bouncySlideIn, start persistent breathing
+    mascot.style.animation = 'none';
+    mascot.style.opacity = '1';
+    mascot.style.transform = 'translateX(0)';
+    startBreathing();
+
+    // PER MESSAGE loop
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
+      const wordSpans = setupMessage(m);
+
+      // Show bubble
+      bubble.className = 'bubble show';
+      if (m.mode === 'permission') bubble.classList.add('permission-pulse');
+
+      // Start voice reactivity (overrides breathing while active)
+      const estDur = m.voiceDur || 3000;
+      startVoiceReactivity(estDur);
+      const step = wordSpans.length > 1 ? estDur / (wordSpans.length - 1) : 0;
+      wordSpans.forEach((span, j) => {
+        setTimeout(() => {
+          span.classList.add('lit');
+          span.style.transform = 'scale(1.08)';
+          setTimeout(() => { span.style.transform = 'scale(1)'; }, 150);
+        }, j * step);
+      });
+
+      // Mood particles
+      startMoodParticles();
+
+      // Mode effects — mood-aware
+      const mc = getMoodConfig();
+      if (m.mode === 'done') {
+        if (currentMood === 'ECSTATIC') { startConfetti(); setTimeout(startConfetti, 300); }
+        else if (mc.particles === 'confetti' || currentMood === 'HAPPY') startConfetti();
+        // Other moods: skip confetti, mood particles suffice
+      }
+      if (m.mode === 'permission') spawnOrbitingMarks();
+
+      // Achievement celebration
+      if (m.achievement) celebrateAchievement(m.achievement);
+
+      // Sleeping: no speech bubble, just ZZZ
+      if (currentMood === 'SLEEPING') {
+        bubble.className = 'bubble';
+        stopMoodParticles();
+        startMoodParticles();
+        await delay(m.duration + 1000);
+        stopMoodParticles();
+        if (i < messages.length - 1) await delay(150);
+        continue;
+      }
+
+      // Play audio — blocks until both lines finish
+      await playVoiceLines(m);
+      await delay(100);
+
+      // Voice done — breathing loop resumes automatically
+      voiceActive = false;
+
+      // Display duration (breathing continues)
+      await delay(m.duration + 1000);
+
+      // Hide bubble (breathing continues)
+      bubble.className = 'bubble hide';
+      stopMoodParticles();
+      await delay(250);
+
+      // Gap before next message (breathing continues)
+      if (i < messages.length - 1) await delay(150);
+    }
+
+    // EXIT (once) — stop breathing, vacuum + spin out
+    stopBreathing();
+    startVacuum();
+    await delay(400);
+    mascot.style.animation = 'spinOut 0.8s ease-in forwards';
+    const shadow = document.querySelector('.mascot-shadow');
+    if (shadow) shadow.style.animation = 'shadowShrink 0.8s ease-in forwards';
+    await delay(900);
+    document.title = 'CLOSE';
+  }
+
+  // --- Click to activate terminal ---
+  document.querySelector('.bubble').addEventListener('click', (e) => {
+    e.stopPropagation();
+    document.title = 'ACTIVATE';
+  });
+
+  // --- Load batch and run ---
+  fetch('file:///tmp/toast-batch.json')
+    .then(r => r.json())
+    .then(data => runBatch(data.messages))
+    .catch(() => {
+      // Fallback: single default message
+      runBatch([{ msg: 'Hello', mode: 'done', duration: 3000, voiceDur: 3000 }]);
+    });
+</script>
+</body>
+</html>
+HTMLEOF
+
+# Write and compile Swift program (cached)
+SWIFT_SRC="/tmp/toast_webview.swift"
+SWIFT_BIN="/tmp/toast_webview"
+
+# Recompile only if binary missing or source changed
+if [ ! -f "$SWIFT_BIN" ] || [ "$0" -nt "$SWIFT_BIN" ]; then
+cat > "$SWIFT_SRC" << 'SWIFTEOF'
+import Cocoa
+import WebKit
+
+class ToastWindowController: NSObject, WKNavigationDelegate {
+    let window: NSWindow
+    let webView: WKWebView
+    var titleObservation: NSKeyValueObservation?
+    var globalMonitor: Any?
+    var localMonitor: Any?
+    var lastHitTestTime: CFAbsoluteTime = 0
+    let hitTestThrottle: CFAbsoluteTime = 0.05  // 50ms
+
+    override init() {
+        let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let winWidth: CGFloat = 420
+        let winHeight: CGFloat = 160
+        let x = screenFrame.maxX - winWidth - 20
+        let y = screenFrame.maxY - winHeight - 20
+
+        let rect = NSRect(x: x, y: y, width: winWidth, height: winHeight)
+
+        window = NSWindow(
+            contentRect: rect,
+            styleMask: .borderless,
+            backing: .buffered,
+            defer: false
+        )
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.level = .floating
+        window.hasShadow = false
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary]
+        window.ignoresMouseEvents = true  // Click-through by default
+
+        let config = WKWebViewConfiguration()
+        config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
+        webView = WKWebView(frame: rect, configuration: config)
+        webView.setValue(false, forKey: "drawsBackground")
+
+        super.init()
+        webView.navigationDelegate = self
+
+        window.contentView = webView
+
+        titleObservation = webView.observe(\.title, options: [.new]) { _, change in
+            guard let newTitle = change.newValue as? String else { return }
+            if newTitle == "ACTIVATE" {
+                let task = Process()
+                task.executableURL = URL(fileURLWithPath: "/bin/bash")
+                task.arguments = ["/tmp/toast-activate.sh"]
+                try? task.run()
+                task.waitUntilExit()
+                NSApplication.shared.terminate(nil)
+            } else if newTitle == "CLOSE" {
+                NSApplication.shared.terminate(nil)
+            }
+        }
+
+        setupMouseMonitors()
+    }
+
+    func setupMouseMonitors() {
+        // Global monitor: fires when window ignoresMouseEvents = true
+        // Detects cursor entering interactive regions
+        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown]) { [weak self] _ in
+            self?.performHitTest()
+        }
+
+        // Local monitor: fires when window accepts events
+        // Detects cursor leaving interactive regions
+        localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown]) { [weak self] event in
+            self?.performHitTest()
+            return event
+        }
+    }
+
+    func performHitTest() {
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastHitTestTime >= hitTestThrottle else { return }
+        lastHitTestTime = now
+
+        let mouseLocation = NSEvent.mouseLocation
+        let windowFrame = window.frame
+
+        // Check if cursor is within the window bounds
+        guard windowFrame.contains(mouseLocation) else {
+            if window.ignoresMouseEvents { return }  // Already ignoring
+            window.ignoresMouseEvents = true
+            return
+        }
+
+        // Convert screen coords to WebView CSS coords
+        // macOS Y is bottom-up, HTML Y is top-down
+        let localX = mouseLocation.x - windowFrame.origin.x
+        let localY = windowFrame.height - (mouseLocation.y - windowFrame.origin.y)
+
+        let js = "document.elementFromPoint(\(localX),\(localY))?.closest('.bubble,.mascot-wrap,.stats-hud') !== null"
+        webView.evaluateJavaScript(js) { [weak self] result, _ in
+            guard let self = self else { return }
+            let isInteractive = result as? Bool ?? false
+            DispatchQueue.main.async {
+                self.window.ignoresMouseEvents = !isInteractive
+            }
+        }
+    }
+
+    func cleanup() {
+        if let monitor = globalMonitor {
+            NSEvent.removeMonitor(monitor)
+            globalMonitor = nil
+        }
+        if let monitor = localMonitor {
+            NSEvent.removeMonitor(monitor)
+            localMonitor = nil
+        }
+    }
+
+    func load(url: URL) {
+        webView.load(URLRequest(url: url))
+        window.orderFrontRegardless()
+    }
+}
+
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+
+let controller = ToastWindowController()
+
+let totalTimeoutMs = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "6000"
+
+controller.load(url: URL(fileURLWithPath: "/tmp/toast.html"))
+
+let totalTimeout = (Double(totalTimeoutMs) ?? 6000) / 1000.0
+DispatchQueue.main.asyncAfter(deadline: .now() + totalTimeout) {
+    controller.cleanup()
+    NSApplication.shared.terminate(nil)
+}
+
+app.run()
+SWIFTEOF
+
+  swiftc -o "$SWIFT_BIN" "$SWIFT_SRC" -framework Cocoa -framework WebKit 2>/dev/null
+fi
+
+# Build click-to-activate script (finds the exact window/tab via TTY)
+TTY_PATH="${TTY:-}"
+if [ -z "$TTY_PATH" ]; then
+  TTY_RAW=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' ')
+  [ -n "$TTY_RAW" ] && [ "$TTY_RAW" != "??" ] && TTY_PATH="/dev/$TTY_RAW"
+fi
+
+ACTIVATE_SCRIPT="/tmp/toast-activate.sh"
+case "${TERM_PROGRAM:-}" in
+  Apple_Terminal)
+    cat > "$ACTIVATE_SCRIPT" << ACTEOF
+osascript -e '
+tell application "Terminal"
+    activate
+    repeat with w in windows
+        repeat with t in tabs of w
+            if tty of t is "$TTY_PATH" then
+                set selected tab of w to t
+                set index of w to 1
+                return
+            end if
+        end repeat
+    end repeat
+end tell'
+ACTEOF
+    ;;
+  iTerm.app)
+    cat > "$ACTIVATE_SCRIPT" << ACTEOF
+osascript -e '
+tell application "iTerm2"
+    activate
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                if tty of s is "$TTY_PATH" then
+                    select t
+                    select s
+                    set index of w to 1
+                    return
+                end if
+            end repeat
+        end repeat
+    end repeat
+end tell'
+ACTEOF
+    ;;
+  ghostty)
+    cat > "$ACTIVATE_SCRIPT" << 'ACTEOF'
+open -a Ghostty
+ACTEOF
+    ;;
+  vscode)
+    cat > "$ACTIVATE_SCRIPT" << 'ACTEOF'
+open -a "Visual Studio Code"
+ACTEOF
+    ;;
+  *)
+    cat > "$ACTIVATE_SCRIPT" << 'ACTEOF'
+true
+ACTEOF
+    ;;
+esac
+chmod +x "$ACTIVATE_SCRIPT"
+
+# --- Background processor loop ---
+# Drains ALL queued files into a batch, launches mascot once per batch.
+(
+  while true; do
+    FILES=($(ls -1 "$QUEUE_DIR" 2>/dev/null | sort))
+    if [ ${#FILES[@]} -eq 0 ]; then
+      rm -f "$PIDFILE"
+      break
+    fi
+
+    # Brief pause to let rapid-fire toasts accumulate
+    sleep 0.15
+    FILES=($(ls -1 "$QUEUE_DIR" 2>/dev/null | sort))
+
+    # Build batch JSON with voice file paths (JS plays audio directly)
+    BATCH_JSON='{"messages":['
+    TOTAL_MS=0
+    FIRST=1
+    LAST_VOICE=""
+    COOLDOWN_FILE="/tmp/toast-voice-cooldown"
+
+    for F in "${FILES[@]}"; do
+      IFS='|' read -r QMODE QMSG QDUR QMOOD QACH < "$QUEUE_DIR/$F"
+      rm -f "$QUEUE_DIR/$F"
+      QMOOD="${QMOOD:-NEUTRAL}"
+      QACH="${QACH:-}"
+
+      # Scale voice line count by message word count
+      WORD_COUNT=$(printf '%s' "$QMSG" | wc -w | tr -d ' ')
+      if [ "$WORD_COUNT" -le 1 ]; then
+        NUM_VOICES=1
+      elif [ "$WORD_COUNT" -le 4 ]; then
+        NUM_VOICES=2
+      elif [ "$WORD_COUNT" -le 8 ]; then
+        NUM_VOICES=3
+      else
+        NUM_VOICES=4
+      fi
+
+      # Pick voice lines with no consecutive duplicates + combination cooldown
+      VOICE_DUR_MS=0
+      VOICES_JSON=""
+      SELECTED_VOICES=()
+      if [ -d "$VOICES_DIR" ]; then
+        ALL_LINES=("$VOICES_DIR"/v*.mp3)
+        RETRIES=0
+        MAX_RETRIES=10
+        FIRST_ATTEMPT=""
+        while true; do
+          SELECTED_VOICES=()
+          PICK_LAST="$LAST_VOICE"
+          for (( i=0; i<NUM_VOICES; i++ )); do
+            # Build candidate pool excluding last picked voice
+            CANDIDATES=()
+            for L in "${ALL_LINES[@]}"; do
+              [ "$L" = "$PICK_LAST" ] && continue
+              CANDIDATES+=("$L")
+            done
+            [ ${#CANDIDATES[@]} -eq 0 ] && CANDIDATES=("${ALL_LINES[@]}")
+            PICK="${CANDIDATES[$((RANDOM % ${#CANDIDATES[@]}))]}"
+            SELECTED_VOICES+=("$PICK")
+            PICK_LAST="$PICK"
+          done
+
+          # Compute order-independent fingerprint
+          FINGERPRINT=$(printf '%s\n' "${SELECTED_VOICES[@]}" | sort | tr '\n' '+' | sed 's/+$//')
+          [ -z "$FIRST_ATTEMPT" ] && FIRST_ATTEMPT="$FINGERPRINT"
+
+          # Check combination cooldown
+          if [ -f "$COOLDOWN_FILE" ] && grep -qxF "$FINGERPRINT" "$COOLDOWN_FILE"; then
+            RETRIES=$((RETRIES + 1))
+            if [ $RETRIES -ge $MAX_RETRIES ]; then
+              # Graceful degradation: accept first attempt
+              # Re-pick using first attempt's fingerprint (already stored)
+              break
+            fi
+            continue
+          fi
+          break
+        done
+
+        # Update LAST_VOICE for next message in batch
+        LAST_VOICE="${SELECTED_VOICES[${#SELECTED_VOICES[@]}-1]}"
+
+        # Update cooldown file (newest first, keep last 5)
+        { echo "$FINGERPRINT"; [ -f "$COOLDOWN_FILE" ] && head -4 "$COOLDOWN_FILE"; } > "${COOLDOWN_FILE}.tmp"
+        mv "${COOLDOWN_FILE}.tmp" "$COOLDOWN_FILE"
+
+        # Sum durations of all selected files
+        for V in "${SELECTED_VOICES[@]}"; do
+          VDUR=$(afinfo "$V" 2>/dev/null | awk '/estimated duration/{printf "%d", $3 * 1000}')
+          VOICE_DUR_MS=$(( VOICE_DUR_MS + ${VDUR:-800} ))
+        done
+
+        # Build JSON voices array
+        VFIRST=1
+        VOICES_JSON="\"voices\":["
+        for V in "${SELECTED_VOICES[@]}"; do
+          [ $VFIRST -eq 1 ] && VFIRST=0 || VOICES_JSON="$VOICES_JSON,"
+          VOICES_JSON="$VOICES_JSON\"$V\""
+        done
+        VOICES_JSON="$VOICES_JSON],"
+      fi
+
+      # Escape message for JSON (handle quotes and backslashes)
+      QMSG_ESC=$(printf '%s' "$QMSG" | sed 's/\\/\\\\/g; s/"/\\"/g')
+
+      # Achievement JSON field
+      ACH_JSON=""
+      [ -n "$QACH" ] && ACH_JSON="\"achievement\":\"$QACH\","
+
+      [ $FIRST -eq 1 ] && FIRST=0 || BATCH_JSON="$BATCH_JSON,"
+      BATCH_JSON="$BATCH_JSON{\"msg\":\"$QMSG_ESC\",\"mode\":\"$QMODE\",\"mood\":\"$QMOOD\",${ACH_JSON}\"duration\":$QDUR,\"voiceDur\":$VOICE_DUR_MS,${VOICES_JSON}\"_\":0}"
+      echo "[toast] mode=$QMODE mood=$QMOOD dur=${QDUR}ms voiceDur=${VOICE_DUR_MS}ms voices=${#SELECTED_VOICES[@]} msg=\"$QMSG\""
+
+      # Per-message display time: voiceDur + 100 + duration + 1000 + 250 (bubbleOut)
+      MSG_TIME=$(( VOICE_DUR_MS + 100 + QDUR + 1000 + 250 ))
+      # Add inter-message gap (150ms) except after last
+      TOTAL_MS=$(( TOTAL_MS + MSG_TIME + 150 ))
+    done
+
+    # Remove trailing gap, add entrance (700ms) and exit (1000ms) + generous margin
+    # for audio playback latency (JS awaits real audio, can be slower than afinfo estimates)
+    TOTAL_MS=$(( TOTAL_MS - 150 + 700 + 1000 + ${#FILES[@]} * 500 + 2000 ))
+
+    BATCH_JSON="$BATCH_JSON]}"
+    echo "$BATCH_JSON" > /tmp/toast-batch.json
+
+    # Run Swift binary SYNCHRONOUSLY (JS handles audio playback)
+    "$SWIFT_BIN" "$TOTAL_MS"
+    sleep 0.3
+  done
+) &
+echo $! > "$PIDFILE"
+disown

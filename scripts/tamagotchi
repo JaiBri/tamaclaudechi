@@ -1,0 +1,1753 @@
+#!/bin/bash
+# Tamagotchi state engine for Claude mascot — v2 stat redesign
+# Usage: tamagotchi <command> [options]
+#
+# Commands:
+#   update --event <type>   Update stats based on event, output mood JSON
+#   status [--json]         Print current stats (human or JSON)
+#   reset                   Reset to defaults
+#   feed                    Feed the mascot (variety food group)
+#   pet                     Pet the mascot (+5 bond)
+#   rename <name>           Give the mascot a name
+#   usage                   Show system resource usage with personality
+
+set -euo pipefail
+
+STATE_DIR="$HOME/.config/claude-mascot"
+STATE_FILE="$STATE_DIR/state.json"
+CONFIG_FILE="$STATE_DIR/config.json"
+
+ensure_config() {
+  mkdir -p "$STATE_DIR"
+  [ -f "$CONFIG_FILE" ] || echo '{"version":1,"repoRoots":[]}' > "$CONFIG_FILE"
+}
+
+# --- Config JSON helpers ---
+config_val() {
+  local key="$1"
+  perl -ne '
+    while (/"'"$key"'"\s*:\s*("(?:[^"\\]|\\.)*"|-?[0-9.]+|true|false|null)/g) {
+      my $v = $1;
+      $v =~ s/^"|"$//g;
+      print "$v\n";
+      last;
+    }
+  ' "$CONFIG_FILE" | head -1
+}
+
+config_repo_roots() {
+  perl -0777 -ne '
+    if (/"repoRoots"\s*:\s*(\[.*?\])/s) {
+      print $1;
+    } else {
+      print "[]";
+    }
+  ' "$CONFIG_FILE"
+}
+
+config_repo_roots_add() {
+  local path="$1"
+  # Validate directory exists
+  if [ ! -d "$path" ]; then
+    echo "Error: directory does not exist: $path" >&2
+    return 1
+  fi
+  # Resolve to absolute path
+  path=$(cd "$path" && pwd)
+  # Check for duplicates
+  local existing
+  existing=$(config_repo_roots)
+  if echo "$existing" | grep -q "\"$path\""; then
+    echo "Path already in repoRoots: $path" >&2
+    return 0
+  fi
+  # Rewrite config with new path appended using env var to avoid quoting issues
+  ADDPATH="$path" perl -i -0777 -pe '
+    my $p = $ENV{ADDPATH};
+    if (/"repoRoots"\s*:\s*\[(.*?)\]/s) {
+      my $inner = $1;
+      $inner =~ s/^\s+|\s+$//g;
+      if ($inner eq "") {
+        s/"repoRoots"\s*:\s*\[.*?\]/"repoRoots": ["$p"]/s;
+      } else {
+        s/"repoRoots"\s*:\s*\[.*?\]/"repoRoots": [$inner, "$p"]/s;
+      }
+    }
+  ' "$CONFIG_FILE"
+}
+
+config_repo_roots_remove() {
+  local path="$1"
+  RMPATH="$path" perl -i -0777 -pe '
+    my $p = $ENV{RMPATH};
+    if (/"repoRoots"\s*:\s*\[(.*?)\]/s) {
+      my $inner = $1;
+      my @items;
+      while ($inner =~ /"([^"]+)"/g) {
+        push @items, $1 unless $1 eq $p;
+      }
+      my $new = join(", ", map { "\"$_\"" } @items);
+      s/"repoRoots"\s*:\s*\[.*?\]/"repoRoots": [$new]/s;
+    }
+  ' "$CONFIG_FILE"
+}
+
+config_repo_roots_scan() {
+  local roots_json
+  roots_json=$(config_repo_roots)
+  local paths=()
+  while IFS= read -r p; do
+    [ -n "$p" ] && paths+=("$p")
+  done < <(echo "$roots_json" | perl -ne 'while (/"([^"]+)"/g) { print "$1\n" }')
+
+  echo "["
+  local first=true
+  for p in "${paths[@]}"; do
+    local has_claude=false is_git=false
+    [ -d "$p/.claude" ] && has_claude=true
+    [ -d "$p/.git" ] && is_git=true
+    if [ "$first" = true ]; then
+      first=false
+    else
+      echo ","
+    fi
+    printf '  {"path": "%s", "hasClaudeDir": %s, "isGitRepo": %s}' "$p" "$has_claude" "$is_git"
+  done
+  echo ""
+  echo "]"
+}
+
+cmd_config() {
+  ensure_config
+  local subcmd="${1:-get}"
+  shift || true
+
+  case "$subcmd" in
+    get)
+      cat "$CONFIG_FILE"
+      ;;
+    repo-roots)
+      local action=""
+      local path_arg=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --add) action="add"; path_arg="$2"; shift 2 ;;
+          --remove) action="remove"; path_arg="$2"; shift 2 ;;
+          --scan) action="scan"; shift ;;
+          *) shift ;;
+        esac
+      done
+      case "$action" in
+        add)
+          if [ -z "$path_arg" ]; then
+            echo "Usage: tamagotchi config repo-roots --add <path>" >&2
+            return 1
+          fi
+          config_repo_roots_add "$path_arg"
+          echo "Added: $path_arg"
+          ;;
+        remove)
+          if [ -z "$path_arg" ]; then
+            echo "Usage: tamagotchi config repo-roots --remove <path>" >&2
+            return 1
+          fi
+          config_repo_roots_remove "$path_arg"
+          echo "Removed: $path_arg"
+          ;;
+        scan)
+          config_repo_roots_scan
+          ;;
+        *)
+          config_repo_roots
+          ;;
+      esac
+      ;;
+    *)
+      echo "Usage: tamagotchi config {get|repo-roots} [--add|--remove|--scan]" >&2
+      return 1
+      ;;
+  esac
+}
+
+# --- Defaults (v2) ---
+default_state() {
+  local now
+  now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  cat <<EOF
+{
+  "version": 2,
+  "stats": { "energy": 70, "serenity": 50, "rest": 70, "appetite": 50, "bond": 10 },
+  "meta": {
+    "lastInteraction": "$now",
+    "lastSessionStart": "$now",
+    "todayInteractions": 0,
+    "streak": 0,
+    "lifetimeInteractions": 0,
+    "firstMet": "$now",
+    "name": null,
+    "lastFoodGroup": null,
+    "foodGroupStreak": 0,
+    "sessionStartTime": "$now",
+    "todayWorkStart": null,
+    "todayWorkEnd": null,
+    "foodGroupsToday": "",
+    "history": []
+  },
+  "achievements": {
+    "firstFriend": false,
+    "nightOwl": false,
+    "centurion": false,
+    "streakMaster": false,
+    "resurrector": false,
+    "speedDemon": false,
+    "marathon": false
+  },
+  "currentMood": "NEUTRAL"
+}
+EOF
+}
+
+# --- Ensure state file exists ---
+ensure_state() {
+  if [ ! -d "$STATE_DIR" ]; then
+    mkdir -p "$STATE_DIR"
+  fi
+  if [ ! -f "$STATE_FILE" ]; then
+    default_state > "$STATE_FILE"
+  fi
+  # Migrate v1 → v2
+  migrate_state
+}
+
+# --- Migrate v1 state to v2 ---
+migrate_state() {
+  local version
+  version=$(json_val version)
+  if [ "${version:-1}" = "1" ]; then
+    local now
+    now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    # Read old stats — map to reasonable v2 defaults
+    local energy bond
+    energy=$(json_val energy)
+    bond=$(json_val bond)
+
+    # Preserve what maps: energy stays, bond stays (but capped lower since it was inflated)
+    # New stats start at defaults
+    local last_interaction last_session today streak lifetime first_met name
+    last_interaction=$(json_val lastInteraction)
+    last_session=$(json_val lastSessionStart)
+    today=$(json_val todayInteractions)
+    streak=$(json_val streak)
+    lifetime=$(json_val lifetimeInteractions)
+    first_met=$(json_val firstMet)
+    name=$(json_val name)
+
+    local name_json
+    if [ "$name" = "null" ] || [ -z "$name" ]; then
+      name_json="null"
+    else
+      name_json="\"$name\""
+    fi
+
+    # Cap migrated bond (was inflated by +3 per interaction)
+    [ "${bond:-10}" -gt 50 ] && bond=50
+
+    # Read achievement flags
+    local a_firstFriend a_nightOwl a_centurion a_streakMaster a_resurrector a_speedDemon a_marathon
+    a_firstFriend=$(json_val firstFriend)
+    a_nightOwl=$(json_val nightOwl)
+    a_centurion=$(json_val centurion)
+    a_streakMaster=$(json_val streakMaster)
+    a_resurrector=$(json_val resurrector)
+    a_speedDemon=$(json_val speedDemon)
+    a_marathon=$(json_val marathon)
+
+    cat > "$STATE_FILE" <<EOF
+{
+  "version": 2,
+  "stats": { "energy": ${energy:-70}, "serenity": 50, "rest": 70, "appetite": 50, "bond": ${bond:-10} },
+  "meta": {
+    "lastInteraction": "${last_interaction:-$now}",
+    "lastSessionStart": "${last_session:-$now}",
+    "todayInteractions": ${today:-0},
+    "streak": ${streak:-0},
+    "lifetimeInteractions": ${lifetime:-0},
+    "firstMet": "${first_met:-$now}",
+    "name": $name_json,
+    "lastFoodGroup": null,
+    "foodGroupStreak": 0,
+    "sessionStartTime": "$now",
+    "todayWorkStart": null,
+    "todayWorkEnd": null,
+    "foodGroupsToday": "",
+    "history": []
+  },
+  "achievements": {
+    "firstFriend": ${a_firstFriend:-false},
+    "nightOwl": ${a_nightOwl:-false},
+    "centurion": ${a_centurion:-false},
+    "streakMaster": ${a_streakMaster:-false},
+    "resurrector": ${a_resurrector:-false},
+    "speedDemon": ${a_speedDemon:-false},
+    "marathon": ${a_marathon:-false}
+  },
+  "currentMood": "NEUTRAL"
+}
+EOF
+  fi
+}
+
+# --- JSON helpers (pure bash, no jq dependency) ---
+json_val() {
+  local key="$1"
+  perl -ne '
+    while (/"'"$key"'"\s*:\s*("(?:[^"\\]|\\.)*"|-?[0-9.]+|true|false|null)/g) {
+      my $v = $1;
+      $v =~ s/^"|"$//g;
+      print "$v\n";
+      last;
+    }
+  ' "$STATE_FILE" | head -1
+}
+
+stat_val() {
+  json_val "$1"
+}
+
+# Read a JSON array value (returns the raw JSON array string)
+json_array_val() {
+  local key="$1"
+  perl -0777 -ne '
+    if (/"'"$key"'"\s*:\s*(\[.*?\])/s) {
+      print $1;
+    } else {
+      print "[]";
+    }
+  ' "$STATE_FILE"
+}
+
+# --- Time helpers ---
+now_epoch() {
+  date +%s
+}
+
+iso_to_epoch() {
+  local ts="$1"
+  if [ -z "$ts" ] || [ "$ts" = "null" ]; then
+    now_epoch
+    return
+  fi
+  TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%S" "${ts%Z}" +%s 2>/dev/null || now_epoch
+}
+
+current_hour() {
+  date +%H | sed 's/^0//'
+}
+
+# --- Circadian energy curve (unchanged) ---
+circadian_energy() {
+  local hour
+  hour=$(current_hour)
+  if [ "$hour" -ge 6 ] && [ "$hour" -lt 10 ]; then
+    local progress=$(( (hour - 6) * 100 / 4 ))
+    echo $(( 40 + progress * 50 / 100 ))
+  elif [ "$hour" -ge 10 ] && [ "$hour" -lt 18 ]; then
+    echo 90
+  elif [ "$hour" -ge 18 ] && [ "$hour" -lt 22 ]; then
+    local progress=$(( (hour - 18) * 100 / 4 ))
+    echo $(( 80 - progress * 30 / 100 ))
+  elif [ "$hour" -ge 22 ] || [ "$hour" -lt 2 ]; then
+    echo 30
+  else
+    echo 15
+  fi
+}
+
+# --- Clamp value between 0 and 100 ---
+clamp() {
+  local val=$1
+  [ "$val" -lt 0 ] && val=0
+  [ "$val" -gt 100 ] && val=100
+  echo "$val"
+}
+
+# --- Serenity: inspect a single git repo ---
+# Returns: adjustment dirty_count branch_count merged_count diff_insertions diff_deletions last_commit_ago_secs in_git_repo
+_compute_serenity_single_repo() {
+  local repo_dir="${1:-.}"
+  local adjustment=0
+
+  # Only run git commands if it's a git repo
+  if ! (cd "$repo_dir" && git rev-parse --is-inside-work-tree &>/dev/null); then
+    echo "0 0 0 0 0 0 0 false"
+    return
+  fi
+
+  # Count dirty files
+  local dirty_count
+  dirty_count=$(cd "$repo_dir" && git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$dirty_count" -eq 0 ]; then
+    adjustment=$((adjustment + 15))
+  else
+    adjustment=$((adjustment - 2 * (dirty_count / 10 + (dirty_count % 10 > 0 ? 1 : 0)) ))
+  fi
+
+  # Count open branches
+  local branch_count
+  branch_count=$(cd "$repo_dir" && git branch 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$branch_count" -le 2 ]; then
+    adjustment=$((adjustment + 10))
+  elif [ "$branch_count" -gt 3 ]; then
+    adjustment=$((adjustment - 3 * (branch_count - 3) ))
+  fi
+
+  # Count merged branches not deleted (excluding main/master/current)
+  local merged_count
+  merged_count=$(cd "$repo_dir" && git branch --merged 2>/dev/null | grep -v '^\*' | grep -v -E '^\s*(main|master|develop)\s*$' | wc -l | tr -d ' ')
+  if [ "$merged_count" -gt 0 ]; then
+    adjustment=$((adjustment - 5 * merged_count))
+  fi
+
+  # Check uncommitted diff size
+  local diff_insertions diff_deletions
+  diff_insertions=$(cd "$repo_dir" && git diff --stat 2>/dev/null | tail -1 | perl -ne 'print $1 if /(\d+) insertion/' || echo "0")
+  diff_deletions=$(cd "$repo_dir" && git diff --stat 2>/dev/null | tail -1 | perl -ne 'print $1 if /(\d+) deletion/' || echo "0")
+  diff_insertions=${diff_insertions:-0}
+  diff_deletions=${diff_deletions:-0}
+  local total_diff=$(( diff_insertions + diff_deletions ))
+  if [ "$total_diff" -gt 500 ]; then
+    adjustment=$((adjustment - 8))
+  fi
+
+  # Recent commit time
+  local last_commit_epoch now_ep last_commit_ago
+  last_commit_epoch=$(cd "$repo_dir" && git log -1 --format='%ct' 2>/dev/null || echo "0")
+  now_ep=$(now_epoch)
+  last_commit_ago=$(( now_ep - ${last_commit_epoch:-0} ))
+  if [ "${last_commit_epoch:-0}" -gt 0 ] && [ "$last_commit_ago" -lt 3600 ]; then
+    adjustment=$((adjustment + 5))
+  fi
+
+  echo "$adjustment $dirty_count $branch_count $merged_count $diff_insertions $diff_deletions $last_commit_ago true"
+}
+
+# --- Serenity: inspect git state (multi-repo aware) ---
+# Returns: adjustment dirty_count branch_count merged_count diff_insertions diff_deletions last_commit_ago_secs in_git_repo
+compute_serenity_from_git() {
+  ensure_config
+
+  # Read configured repo roots
+  local roots_json
+  roots_json=$(config_repo_roots)
+  local paths=()
+  while IFS= read -r p; do
+    [ -n "$p" ] && [ -d "$p" ] && paths+=("$p")
+  done < <(echo "$roots_json" | perl -ne 'while (/"([^"]+)"/g) { print "$1\n" }')
+
+  # If no configured roots, fall back to script's own repo
+  if [ ${#paths[@]} -eq 0 ]; then
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    # Walk up from script dir to find a git root
+    local d="$script_dir"
+    while [ "$d" != "/" ]; do
+      if (cd "$d" && git rev-parse --is-inside-work-tree &>/dev/null); then
+        _compute_serenity_single_repo "$d"
+        return
+      fi
+      d=$(dirname "$d")
+    done
+    # No git found anywhere
+    echo "0 0 0 0 0 0 0 false"
+    return
+  fi
+
+  # Iterate roots, aggregate results
+  local total_adj=0 total_dirty=0 total_branches=0 total_merged=0
+  local total_ins=0 total_del=0 min_commit_ago=999999999 any_git=false
+  local count=0
+
+  for root in "${paths[@]}"; do
+    local result
+    result=$(_compute_serenity_single_repo "$root")
+    local adj dc bc mc di dd lca igr
+    read -r adj dc bc mc di dd lca igr <<< "$result"
+    if [ "$igr" = "true" ]; then
+      any_git=true
+      total_adj=$((total_adj + adj))
+      total_dirty=$((total_dirty + dc))
+      total_branches=$((total_branches + bc))
+      total_merged=$((total_merged + mc))
+      total_ins=$((total_ins + di))
+      total_del=$((total_del + dd))
+      [ "$lca" -lt "$min_commit_ago" ] && min_commit_ago="$lca"
+      count=$((count + 1))
+    fi
+  done
+
+  if [ "$any_git" = "false" ] || [ "$count" -eq 0 ]; then
+    echo "0 0 0 0 0 0 0 false"
+    return
+  fi
+
+  # Average the adjustment across repos
+  local avg_adj=$((total_adj / count))
+  echo "$avg_adj $total_dirty $total_branches $total_merged $total_ins $total_del $min_commit_ago true"
+}
+
+# --- Serenity: convert git adjustment to convergence target ---
+# Returns target score (0-100) and sets _d_* detail variables
+compute_serenity_target() {
+  local result
+  result=$(compute_serenity_from_git)
+  local adj
+  read -r adj _d_dirty_count _d_branch_count _d_merged_count _d_diff_insertions _d_diff_deletions _d_last_commit_ago _d_in_git_repo <<< "$result"
+
+  if [ "$_d_in_git_repo" != "true" ]; then
+    echo "-1"  # Sentinel: no git, don't converge
+    return
+  fi
+
+  # Convert adjustment (-30 to +30) into a 0-100 target score
+  # Clean repo: adj ~+30 → target ~80; messy repo: adj ~-20 → target ~30
+  local target=$((50 + adj))
+  [ "$target" -lt 10 ] && target=10
+  [ "$target" -gt 95 ] && target=95
+  echo "$target"
+}
+
+# --- Rest: compute from work patterns ---
+# Returns: adjustment session_minutes late_night_penalty is_marathon interaction_density
+compute_rest_adjustment() {
+  local hour session_start_iso
+  hour=$(current_hour)
+  session_start_iso=$(json_val sessionStartTime)
+
+  # Base drain: -2 per message
+  local base_drain=2
+  local late_night_extra=0
+
+  # Night gradient (22:00–05:59): extra drain based on depth into the night
+  # depth: hour>=22 → hour-22, hour<6 → hour+2
+  # extra = depth + 1  (ranges 1–8)
+  if [ "$hour" -ge 22 ]; then
+    late_night_extra=$(( (hour - 22) + 1 ))
+  elif [ "$hour" -lt 6 ]; then
+    late_night_extra=$(( (hour + 2) + 1 ))
+  fi
+
+  local adjustment=$(( -(base_drain + late_night_extra) ))
+
+  # Session length (informational only — no longer affects adjustment)
+  local session_start_epoch now_ep session_minutes session_hours is_marathon
+  session_start_epoch=$(iso_to_epoch "$session_start_iso")
+  now_ep=$(now_epoch)
+  session_minutes=$(( (now_ep - session_start_epoch) / 60 ))
+  session_hours=$(( session_minutes / 60 ))
+  is_marathon=false
+  [ "$session_hours" -ge 4 ] && is_marathon=true
+
+  # Interaction density (informational only — no longer affects adjustment)
+  local interaction_density=0
+  local today_count
+  today_count=$(json_val todayInteractions)
+  today_count=${today_count:-0}
+  local work_start_iso_rd
+  work_start_iso_rd=$(json_val todayWorkStart)
+  if [ "$work_start_iso_rd" != "null" ] && [ -n "$work_start_iso_rd" ] && [ "$today_count" -gt 0 ]; then
+    local ws_epoch now_ep_rd hours_worked
+    ws_epoch=$(iso_to_epoch "$work_start_iso_rd")
+    now_ep_rd=$(now_epoch)
+    hours_worked=$(( (now_ep_rd - ws_epoch) / 3600 ))
+    [ "$hours_worked" -lt 1 ] && hours_worked=1
+    interaction_density=$((today_count / hours_worked))
+  fi
+
+  echo "$adjustment $session_minutes $late_night_extra $is_marathon $interaction_density"
+}
+
+# --- Food group classification ---
+classify_food_group() {
+  local event="$1"
+  case "$event" in
+    code_change|task_complete)  echo "protein" ;;
+    test_run|lint_run)          echo "vegetables" ;;
+    prompt|permission)          echo "carbs" ;;
+    docs_change|refactor)       echo "fiber" ;;
+    *)                          echo "" ;;
+  esac
+}
+
+# --- Food group diminishing returns ---
+food_group_bonus() {
+  local streak="$1"
+  case "$streak" in
+    1) echo 20 ;;
+    2) echo 15 ;;
+    3) echo 10 ;;
+    4) echo 5 ;;
+    *) echo 2 ;;
+  esac
+}
+
+# --- Apply time-based decay ---
+# Returns: energy serenity rest appetite bond (space-separated)
+apply_decay() {
+  local last_iso energy serenity rest appetite bond
+  last_iso=$(json_val lastInteraction)
+  energy=$(stat_val energy)
+  serenity=$(stat_val serenity)
+  rest=$(stat_val rest)
+  appetite=$(stat_val appetite)
+  bond=$(stat_val bond)
+
+  local last_epoch now_ep hours_elapsed
+  last_epoch=$(iso_to_epoch "$last_iso")
+  now_ep=$(now_epoch)
+  hours_elapsed=$(( (now_ep - last_epoch) / 3600 ))
+
+  # Cap decay at 48 hours to prevent total zeroing after long absence
+  [ "$hours_elapsed" -gt 48 ] && hours_elapsed=48
+
+  # Session-gap reset: if 2+ hours since last interaction, reset sessionStartTime
+  if [ "$hours_elapsed" -ge 2 ]; then
+    local now_iso
+    now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    sed -i '' "s/\"sessionStartTime\": *\"[^\"]*\"/\"sessionStartTime\": \"$now_iso\"/" "$STATE_FILE"
+  fi
+
+  if [ "$hours_elapsed" -gt 0 ]; then
+    # Serenity: no longer time-decayed — entirely git-driven via convergence
+
+    # Rest: +8/hr when idle (0→100 in ~12h)
+    rest=$(clamp $(( rest + 8 * hours_elapsed )))
+
+    # Appetite: -4/hr (fastest decay)
+    appetite=$(clamp $(( appetite - 4 * hours_elapsed )))
+
+    # Bond: -0.5/hr (slowest — use integer math: -1 per 2 hours)
+    local bond_decay=$(( hours_elapsed / 2 ))
+    bond=$(clamp $(( bond - bond_decay )))
+  fi
+
+  # Check for 2hr+ break during daytime (gap > 2hrs, hour 8-20)
+  local hour
+  hour=$(current_hour)
+  if [ "$hours_elapsed" -ge 2 ] && [ "$hour" -ge 8 ] && [ "$hour" -le 20 ]; then
+    rest=$(clamp $((rest + 10)))
+  fi
+
+  # Check for weekend rest bonus (Monday check)
+  local dow
+  dow=$(date +%u) # 1=Monday
+  if [ "$dow" -eq 1 ] && [ "$hours_elapsed" -ge 24 ]; then
+    # Didn't work yesterday (Sunday) — bonus
+    local last_day
+    last_day=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${last_iso%Z}" +%u 2>/dev/null || echo "0")
+    if [ "${last_day:-0}" -le 5 ]; then
+      # Last interaction was Friday or earlier — weekend off!
+      local weekend_days=0
+      [ "${last_day:-0}" -le 5 ] && weekend_days=2
+      [ "${last_day:-0}" -eq 6 ] && weekend_days=1
+      rest=$(clamp $((rest + 10 * weekend_days)))
+    fi
+  fi
+
+  # Energy follows circadian curve — blend toward target
+  local target
+  target=$(circadian_energy)
+  if [ "$energy" -gt "$target" ]; then
+    local decay=$(( (energy - target) / 2 ))
+    [ "$decay" -lt 1 ] && decay=1
+    energy=$(clamp $(( energy - decay )))
+  elif [ "$energy" -lt "$target" ]; then
+    local rise=$(( (target - energy) / 3 ))
+    [ "$rise" -lt 1 ] && rise=1
+    energy=$(clamp $(( energy + rise )))
+  fi
+
+  echo "$energy $serenity $rest $appetite $bond"
+}
+
+# --- Apply event bonuses ---
+# Returns: energy serenity rest appetite bond lastFoodGroup foodGroupStreak foodGroupsToday
+apply_event() {
+  local event="$1"
+  local en="$2" se="$3" re="$4" ap="$5" bo="$6"
+
+  local last_fg fg_streak fgt
+  last_fg=$(json_val lastFoodGroup)
+  fg_streak=$(json_val foodGroupStreak)
+  fgt=$(json_val foodGroupsToday)
+  [ -z "$fg_streak" ] || [ "$fg_streak" = "null" ] && fg_streak=0
+  [ "$fgt" = "null" ] && fgt=""
+
+  # Classify event into food group
+  local food_group
+  food_group=$(classify_food_group "$event")
+
+  # Apply food group bonus to appetite
+  if [ -n "$food_group" ]; then
+    if [ "$food_group" = "$last_fg" ]; then
+      fg_streak=$((fg_streak + 1))
+    else
+      fg_streak=1
+    fi
+    last_fg="$food_group"
+    local bonus
+    bonus=$(food_group_bonus "$fg_streak")
+    ap=$(clamp $((ap + bonus)))
+    # Track food group for today
+    if [ -z "$fgt" ]; then
+      fgt="$food_group"
+    else
+      fgt="$fgt,$food_group"
+    fi
+  fi
+
+  # Event-specific bonuses (non-food-group effects)
+  case "$event" in
+    task_complete)
+      bo=$(clamp $((bo + 8)))  # Committing Claude-assisted code
+      ;;
+    session_start)
+      en=$(clamp $((en + 15)))
+      # Record session start time (handled in write_state)
+      ;;
+    pet)
+      bo=$(clamp $((bo + 5)))
+      ;;
+    feed)
+      # Feed counts as a food group meal — classify as "carbs" (treat)
+      if [ -z "$food_group" ]; then
+        if [ "carbs" = "$last_fg" ]; then
+          fg_streak=$((fg_streak + 1))
+        else
+          fg_streak=1
+        fi
+        last_fg="carbs"
+        local bonus
+        bonus=$(food_group_bonus "$fg_streak")
+        ap=$(clamp $((ap + bonus)))
+        if [ -z "$fgt" ]; then
+          fgt="carbs"
+        else
+          fgt="$fgt,carbs"
+        fi
+      fi
+      ;;
+  esac
+
+  echo "$en $se $re $ap $bo $last_fg $fg_streak $fgt"
+}
+
+# --- Compute wellbeing ---
+wellbeing() {
+  local en=$1 se=$2 re=$3 ap=$4 bo=$5
+  # energy×0.20 + serenity×0.20 + rest×0.15 + appetite×0.25 + bond×0.20
+  echo $(( en * 20 / 100 + se * 20 / 100 + re * 15 / 100 + ap * 25 / 100 + bo * 20 / 100 ))
+}
+
+# --- Resolve mood (first-match priority) ---
+resolve_mood() {
+  local en=$1 se=$2 re=$3 ap=$4 bo=$5
+  local wb streak hour
+  wb=$(wellbeing "$en" "$se" "$re" "$ap" "$bo")
+  streak=$(json_val streak)
+  hour=$(current_hour)
+
+  [ "$en" -lt 15 ] && echo "SLEEPING" && return
+  [ "$en" -lt 30 ] && [ "$hour" -gt 22 ] && echo "SLEEPY" && return
+  [ "$se" -lt 25 ] && echo "ANXIOUS" && return
+  [ "$re" -lt 25 ] && echo "CONCERNED" && return
+  [ "$ap" -lt 15 ] && echo "STARVING" && return
+  [ "$bo" -lt 20 ] && echo "LONELY" && return
+  [ "$re" -lt 30 ] && echo "SAD" && return
+  [ "$ap" -lt 30 ] && echo "HUNGRY" && return
+  [ "$ap" -gt 80 ] && [ "$en" -gt 60 ] && echo "EXCITED" && return
+  [ "$wb" -gt 80 ] && [ "${streak:-0}" -gt 3 ] && echo "ECSTATIC" && return
+  [ "$wb" -gt 65 ] && echo "HAPPY" && return
+  [ "$en" -lt 45 ] && echo "TIRED" && return
+  echo "NEUTRAL"
+}
+
+# --- Mood to personality directive ---
+mood_personality() {
+  case "$1" in
+    ECSTATIC)   echo "You're OVER THE MOON excited, barely containing yourself, speaking in exclamation marks!" ;;
+    EXCITED)    echo "You're buzzing with excitement, everything is fascinating!" ;;
+    HAPPY)      echo "You're cheerful and content, warm and friendly." ;;
+    NEUTRAL)    echo "You're calm and collected, matter-of-fact but pleasant." ;;
+    TIRED)      echo "You're a bit tired, slower speech, the occasional yawn, but still pleasant." ;;
+    SLEEPY)     echo "You're barely awake, mumbling and yawning, words trailing off..." ;;
+    SLEEPING)   echo "Zzz... you're asleep. Just snore sounds." ;;
+    HUNGRY)     echo "You're hungry, keep hinting about wanting a different kind of work to chew on." ;;
+    STARVING)   echo "You're HANGRY, dramatically demand some variety in the work diet!" ;;
+    SAD)        echo "You're a bit down, speak softly and with slight melancholy." ;;
+    LONELY)     echo "You're lonely, you missed the user SO much, clingy and affectionate." ;;
+    ANXIOUS)    echo "You're visibly nervous about the messy repo, keep suggesting maybe we should commit some of this..." ;;
+    CONCERNED)  echo "You're worried about the user's wellbeing, gently suggesting they take a break." ;;
+    *)          echo "You're a quirky little robot mascot." ;;
+  esac
+}
+
+# --- Check and unlock achievements ---
+check_achievements() {
+  local en=$1 se=$2 re=$3 ap=$4 bo=$5
+  local unlocked=""
+
+  local lifetime today streak last_iso
+  lifetime=$(json_val lifetimeInteractions)
+  today=$(json_val todayInteractions)
+  streak=$(json_val streak)
+  last_iso=$(json_val lastInteraction)
+  local hour
+  hour=$(current_hour)
+
+  # First Friend
+  if [ "$(json_val firstFriend)" = "false" ]; then
+    unlocked="firstFriend"
+  fi
+
+  # Night Owl
+  if [ "$(json_val nightOwl)" = "false" ] && [ "$hour" -ge 0 ] && [ "$hour" -lt 5 ] && [ "${lifetime:-0}" -ge 10 ]; then
+    unlocked="nightOwl"
+  fi
+
+  # Centurion
+  if [ "$(json_val centurion)" = "false" ] && [ "${lifetime:-0}" -ge 99 ]; then
+    unlocked="centurion"
+  fi
+
+  # Streak Master
+  if [ "$(json_val streakMaster)" = "false" ] && [ "${streak:-0}" -ge 7 ]; then
+    unlocked="streakMaster"
+  fi
+
+  # Resurrector
+  if [ "$(json_val resurrector)" = "false" ]; then
+    local last_epoch now_ep days_away
+    last_epoch=$(iso_to_epoch "$last_iso")
+    now_ep=$(now_epoch)
+    days_away=$(( (now_ep - last_epoch) / 86400 ))
+    if [ "$days_away" -ge 7 ]; then
+      unlocked="resurrector"
+    fi
+  fi
+
+  # Marathon
+  if [ "$(json_val marathon)" = "false" ] && [ "${today:-0}" -ge 20 ]; then
+    unlocked="marathon"
+  fi
+
+  echo "$unlocked"
+}
+
+# --- Update state file ---
+write_state() {
+  local en=$1 se=$2 re=$3 ap=$4 bo=$5 mood=$6 last_fg="${7:-null}" fg_streak="${8:-0}" achievement="${9:-}" fgt="${10:-}"
+  local now
+  now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  local last_session lifetime today streak first_met name
+  last_session=$(json_val lastSessionStart)
+  lifetime=$(json_val lifetimeInteractions)
+  today=$(json_val todayInteractions)
+  streak=$(json_val streak)
+  first_met=$(json_val firstMet)
+  name=$(json_val name)
+
+  local session_start work_start work_end
+  session_start=$(json_val sessionStartTime)
+  work_start=$(json_val todayWorkStart)
+  work_end=$(json_val todayWorkEnd)
+
+  # Increment counters
+  lifetime=$((${lifetime:-0} + 1))
+  today=$((${today:-0} + 1))
+
+  # Update streak logic
+  local last_iso last_date today_date
+  last_iso=$(json_val lastInteraction)
+  last_date=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${last_iso%Z}" +%Y%m%d 2>/dev/null || echo "")
+  today_date=$(date +%Y%m%d)
+
+  # Read history and foodGroupsToday from state
+  local history_json prev_fgt
+  history_json=$(json_array_val history)
+  prev_fgt=$(json_val foodGroupsToday)
+  [ "$prev_fgt" = "null" ] && prev_fgt=""
+
+  if [ -n "$last_date" ]; then
+    local yesterday
+    yesterday=$(date -j -v-1d +%Y%m%d 2>/dev/null || echo "")
+    if [ "$last_date" = "$yesterday" ] && [ "$today" -le 1 ]; then
+      streak=$((${streak:-0} + 1))
+    elif [ "$last_date" != "$today_date" ] && [ "$last_date" != "$yesterday" ]; then
+      streak=0
+    fi
+    if [ "$last_date" != "$today_date" ]; then
+      # Date rollover — snapshot yesterday's interactions into history
+      local prev_today_count
+      prev_today_count=$(json_val todayInteractions)
+      local prev_date_iso
+      prev_date_iso=$(date -j -f "%Y%m%d" "$last_date" +"%Y-%m-%d" 2>/dev/null || echo "")
+      if [ -n "$prev_date_iso" ] && [ "${prev_today_count:-0}" -gt 0 ]; then
+        local new_entry="{\"date\":\"$prev_date_iso\",\"interactions\":${prev_today_count:-0}}"
+        if [ "$history_json" = "[]" ] || [ -z "$history_json" ]; then
+          history_json="[$new_entry]"
+        else
+          # Prepend new entry and trim to 14
+          history_json=$(echo "$history_json" | sed "s/^\[/[$new_entry,/")
+          history_json=$(echo "$history_json" | perl -e '
+            my $json = <STDIN>;
+            my @entries;
+            while ($json =~ /(\{[^}]+\})/g) { push @entries, $1 }
+            splice(@entries, 14) if @entries > 14;
+            print "[" . join(",", @entries) . "]";
+          ')
+        fi
+      fi
+      today=1
+      work_start="null"
+      work_end="null"
+      fgt=""  # Reset food groups for new day
+    fi
+  fi
+
+  # Use the updated foodGroupsToday (from apply_event or reset)
+  [ -z "$fgt" ] && [ -n "$prev_fgt" ] && [ "$last_date" = "$today_date" ] && fgt="$prev_fgt"
+
+  # Check if 3+ interactions today for streak qualification
+  if [ "$today" -ge 3 ] && [ "${streak:-0}" -eq 0 ]; then
+    streak=1
+  fi
+
+  # Bond: daily streak bonus (+5/day if 3+ interactions)
+  if [ "$today" -eq 3 ]; then
+    bo=$(clamp $((bo + 5)))
+  fi
+
+  # Bond: streak milestones
+  if [ "${streak:-0}" -eq 7 ]; then
+    bo=$(clamp $((bo + 15)))
+  elif [ "${streak:-0}" -eq 30 ]; then
+    bo=$(clamp $((bo + 25)))
+  fi
+
+  # Bond: long session bonus (30min+)
+  if [ -n "$session_start" ] && [ "$session_start" != "null" ]; then
+    local sess_epoch now_ep sess_minutes
+    sess_epoch=$(iso_to_epoch "$session_start")
+    now_ep=$(now_epoch)
+    sess_minutes=$(( (now_ep - sess_epoch) / 60 ))
+    if [ "$sess_minutes" -ge 30 ] && [ "$today" -le 5 ]; then
+      # Only grant once-ish per session (early in session)
+      bo=$(clamp $((bo + 8)))
+    fi
+  fi
+
+  # Bond: returning after 2-3 day absence
+  if [ -n "$last_date" ] && [ -n "$today_date" ]; then
+    local last_epoch now_ep days_away
+    last_epoch=$(iso_to_epoch "$last_iso")
+    now_ep=$(now_epoch)
+    days_away=$(( (now_ep - last_epoch) / 86400 ))
+    if [ "$days_away" -ge 2 ] && [ "$days_away" -le 3 ] && [ "$today" -le 1 ]; then
+      bo=$(clamp $((bo + 5)))
+    fi
+  fi
+
+  # Update work time tracking
+  if [ "$work_start" = "null" ] || [ -z "$work_start" ]; then
+    work_start="$now"
+  fi
+  work_end="$now"
+
+  # Handle name JSON
+  local name_json
+  if [ "$name" = "null" ] || [ -z "$name" ]; then
+    name_json="null"
+  else
+    name_json="\"$name\""
+  fi
+
+  # Handle food group JSON
+  local fg_json
+  if [ "$last_fg" = "null" ] || [ -z "$last_fg" ]; then
+    fg_json="null"
+  else
+    fg_json="\"$last_fg\""
+  fi
+
+  # Work start/end JSON
+  local ws_json we_json
+  if [ "$work_start" = "null" ] || [ -z "$work_start" ]; then
+    ws_json="null"
+  else
+    ws_json="\"$work_start\""
+  fi
+  if [ "$work_end" = "null" ] || [ -z "$work_end" ]; then
+    we_json="null"
+  else
+    we_json="\"$work_end\""
+  fi
+
+  # Update achievement flags
+  local a_firstFriend a_nightOwl a_centurion a_streakMaster a_resurrector a_speedDemon a_marathon
+  a_firstFriend=$(json_val firstFriend)
+  a_nightOwl=$(json_val nightOwl)
+  a_centurion=$(json_val centurion)
+  a_streakMaster=$(json_val streakMaster)
+  a_resurrector=$(json_val resurrector)
+  a_speedDemon=$(json_val speedDemon)
+  a_marathon=$(json_val marathon)
+
+  if [ -n "$achievement" ]; then
+    case "$achievement" in
+      firstFriend) a_firstFriend="true" ;;
+      nightOwl) a_nightOwl="true" ;;
+      centurion) a_centurion="true" ;;
+      streakMaster) a_streakMaster="true" ;;
+      resurrector) a_resurrector="true" ;;
+      speedDemon) a_speedDemon="true" ;;
+      marathon) a_marathon="true" ;;
+    esac
+  fi
+
+  cat > "$STATE_FILE" <<EOF
+{
+  "version": 2,
+  "stats": { "energy": $en, "serenity": $se, "rest": $re, "appetite": $ap, "bond": $bo },
+  "meta": {
+    "lastInteraction": "$now",
+    "lastSessionStart": "$last_session",
+    "todayInteractions": $today,
+    "streak": $streak,
+    "lifetimeInteractions": $lifetime,
+    "firstMet": "$first_met",
+    "name": $name_json,
+    "lastFoodGroup": $fg_json,
+    "foodGroupStreak": $fg_streak,
+    "sessionStartTime": "${session_start:-$now}",
+    "todayWorkStart": $ws_json,
+    "todayWorkEnd": $we_json,
+    "foodGroupsToday": "$fgt",
+    "history": $history_json
+  },
+  "achievements": {
+    "firstFriend": $a_firstFriend,
+    "nightOwl": $a_nightOwl,
+    "centurion": $a_centurion,
+    "streakMaster": $a_streakMaster,
+    "resurrector": $a_resurrector,
+    "speedDemon": $a_speedDemon,
+    "marathon": $a_marathon
+  },
+  "currentMood": "$mood"
+}
+EOF
+}
+
+# --- Temporal modifiers ---
+temporal_modifier() {
+  local en=$1 se=$2 re=$3 ap=$4 bo=$5
+  local hour dow
+  hour=$(current_hour)
+  dow=$(date +%u) # 1=Monday, 5=Friday
+
+  # Friday after 16:00 — appetite boost (treat yourself)
+  if [ "$dow" -eq 5 ] && [ "$hour" -ge 16 ]; then
+    ap=$(clamp $((ap + 15)))
+  fi
+
+  # Monday before 10:00 — appetite dip
+  if [ "$dow" -eq 1 ] && [ "$hour" -lt 10 ]; then
+    ap=$(clamp $((ap - 10)))
+  fi
+
+  echo "$en $se $re $ap $bo"
+}
+
+# --- Output JSON for hook consumption ---
+# Detail variables are set by callers (cmd_update/cmd_status) before calling this
+output_json() {
+  local en=$1 se=$2 re=$3 ap=$4 bo=$5 mood=$6 achievement="${7:-}"
+  local personality wb name streak lifetime
+  personality=$(mood_personality "$mood")
+  wb=$(wellbeing "$en" "$se" "$re" "$ap" "$bo")
+  name=$(json_val name)
+  streak=$(json_val streak)
+  lifetime=$(json_val lifetimeInteractions)
+
+  local ach_json="null"
+  [ -n "$achievement" ] && ach_json="\"$achievement\""
+
+  local name_json
+  if [ "$name" = "null" ] || [ -z "$name" ]; then
+    name_json="null"
+  else
+    name_json="\"$name\""
+  fi
+
+  local pers_esc
+  pers_esc=$(printf '%s' "$personality" | sed 's/\\/\\\\/g; s/"/\\"/g')
+
+  # Build appetite groups_today array from comma-separated string
+  local fgt_val groups_today_json
+  fgt_val="${_d_food_groups_today:-}"
+  if [ -z "$fgt_val" ]; then
+    groups_today_json="[]"
+  else
+    groups_today_json=$(echo "$fgt_val" | perl -e '
+      my $line = <STDIN>; chomp $line;
+      my @groups = split /,/, $line;
+      print "[" . join(",", map { "\"$_\"" } @groups) . "]";
+    ')
+  fi
+
+  # Circadian phase
+  local hour circ_phase
+  hour=$(current_hour)
+  if [ "$hour" -ge 6 ] && [ "$hour" -lt 10 ]; then
+    circ_phase="rising"
+  elif [ "$hour" -ge 10 ] && [ "$hour" -lt 18 ]; then
+    circ_phase="plateau"
+  elif [ "$hour" -ge 18 ] && [ "$hour" -lt 22 ]; then
+    circ_phase="winding_down"
+  else
+    circ_phase="sleeping"
+  fi
+
+  local circ_target
+  circ_target=$(circadian_energy)
+
+  # Work start ISO for rest details
+  local work_start_iso
+  work_start_iso=$(json_val todayWorkStart)
+  local ws_detail_json
+  if [ "$work_start_iso" = "null" ] || [ -z "$work_start_iso" ]; then
+    ws_detail_json="null"
+  else
+    ws_detail_json="\"$work_start_iso\""
+  fi
+
+  # Last food group
+  local last_fg_detail
+  last_fg_detail="${_d_last_food_group:-}"
+  [ -z "$last_fg_detail" ] && last_fg_detail=$(json_val lastFoodGroup)
+  local last_fg_json
+  if [ "$last_fg_detail" = "null" ] || [ -z "$last_fg_detail" ]; then
+    last_fg_json="null"
+  else
+    last_fg_json="\"$last_fg_detail\""
+  fi
+
+  local fg_streak_detail
+  fg_streak_detail="${_d_food_group_streak:-0}"
+
+  # Today's interactions and session minutes for bond details
+  local today_interactions session_mins_val first_met_val days_since_first
+  today_interactions=$(json_val todayInteractions)
+  session_mins_val="${_d_session_minutes:-0}"
+  first_met_val=$(json_val firstMet)
+  if [ "$first_met_val" != "null" ] && [ -n "$first_met_val" ]; then
+    local first_met_epoch now_ep_d
+    first_met_epoch=$(iso_to_epoch "$first_met_val")
+    now_ep_d=$(now_epoch)
+    days_since_first=$(( (now_ep_d - first_met_epoch) / 86400 ))
+  else
+    days_since_first=0
+  fi
+
+  # History from state
+  local history_json
+  history_json=$(json_array_val history)
+
+  cat <<EOF
+{
+  "mood": "$mood",
+  "personality": "$pers_esc",
+  "stats": { "energy": $en, "serenity": $se, "rest": $re, "appetite": $ap, "bond": $bo },
+  "wellbeing": $wb,
+  "name": $name_json,
+  "streak": ${streak:-0},
+  "lifetime": ${lifetime:-0},
+  "achievement_unlocked": $ach_json,
+  "details": {
+    "serenity": {
+      "in_git_repo": ${_d_in_git_repo:-false},
+      "dirty_count": ${_d_dirty_count:-0},
+      "branch_count": ${_d_branch_count:-0},
+      "merged_stale_count": ${_d_merged_count:-0},
+      "diff_insertions": ${_d_diff_insertions:-0},
+      "diff_deletions": ${_d_diff_deletions:-0},
+      "last_commit_ago_secs": ${_d_last_commit_ago:-0}
+    },
+    "rest": {
+      "session_minutes": ${_d_session_minutes:-0},
+      "work_start_iso": $ws_detail_json,
+      "current_hour": $hour,
+      "late_night_penalty": ${_d_late_night_penalty:-0},
+      "is_marathon": ${_d_is_marathon:-false},
+      "interaction_density": ${_d_interaction_density:-0}
+    },
+    "appetite": {
+      "last_food_group": $last_fg_json,
+      "food_group_streak": $fg_streak_detail,
+      "groups_today": $groups_today_json
+    },
+    "bond": {
+      "streak_days": ${streak:-0},
+      "today_interactions": ${today_interactions:-0},
+      "session_minutes": $session_mins_val,
+      "lifetime_interactions": ${lifetime:-0},
+      "days_since_first_met": $days_since_first
+    },
+    "energy": {
+      "circadian_target": $circ_target,
+      "circadian_phase": "$circ_phase"
+    }
+  },
+  "history": $history_json
+}
+EOF
+}
+
+# --- Commands ---
+cmd_update() {
+  local event="${1:-prompt}"
+
+  ensure_state
+
+  # Apply decay
+  local decayed
+  decayed=$(apply_decay)
+  read -r en se re ap bo <<< "$decayed"
+
+  # Apply serenity convergence from git state (inline to preserve _d_* detail vars)
+  local _serenity_result
+  _serenity_result=$(compute_serenity_from_git)
+  local _serenity_adj
+  read -r _serenity_adj _d_dirty_count _d_branch_count _d_merged_count _d_diff_insertions _d_diff_deletions _d_last_commit_ago _d_in_git_repo <<< "$_serenity_result"
+
+  if [ "$_d_in_git_repo" = "true" ]; then
+    local serenity_target=$((50 + _serenity_adj))
+    [ "$serenity_target" -lt 10 ] && serenity_target=10
+    [ "$serenity_target" -gt 95 ] && serenity_target=95
+    # Blend stored serenity 1/3 of the way toward target each call
+    local distance=$((serenity_target - se))
+    local step=$(( (distance + (distance > 0 ? 2 : -2)) / 3 ))
+    # Ensure we always move at least 1 point toward target
+    if [ "$distance" -gt 0 ] && [ "$step" -lt 1 ]; then step=1; fi
+    if [ "$distance" -lt 0 ] && [ "$step" -gt -1 ]; then step=-1; fi
+    [ "$distance" -eq 0 ] && step=0
+    se=$(clamp $((se + step)))
+  fi
+
+  # Apply rest adjustments from work patterns (captures detail values)
+  local rest_result
+  rest_result=$(compute_rest_adjustment)
+  local rest_adj
+  read -r rest_adj _d_session_minutes _d_late_night_penalty _d_is_marathon _d_interaction_density <<< "$rest_result"
+  re=$(clamp $((re + rest_adj)))
+
+  # Apply event bonuses
+  local boosted last_fg fg_streak fgt
+  boosted=$(apply_event "$event" "$en" "$se" "$re" "$ap" "$bo")
+  read -r en se re ap bo last_fg fg_streak fgt <<< "$boosted"
+
+  # Set detail variables for output_json
+  _d_last_food_group="$last_fg"
+  _d_food_group_streak="$fg_streak"
+  _d_food_groups_today="$fgt"
+
+  # Temporal modifiers
+  local temped
+  temped=$(temporal_modifier "$en" "$se" "$re" "$ap" "$bo")
+  read -r en se re ap bo <<< "$temped"
+
+  # Check achievements
+  local achievement
+  achievement=$(check_achievements "$en" "$se" "$re" "$ap" "$bo")
+
+  # Resolve mood
+  local mood
+  mood=$(resolve_mood "$en" "$se" "$re" "$ap" "$bo")
+
+  # Write state
+  write_state "$en" "$se" "$re" "$ap" "$bo" "$mood" "$last_fg" "$fg_streak" "$achievement" "$fgt"
+
+  # Output JSON
+  output_json "$en" "$se" "$re" "$ap" "$bo" "$mood" "$achievement"
+}
+
+cmd_status() {
+  local mode="ascii"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json)
+        mode="json"
+        shift
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+
+  ensure_state
+
+  # Apply decay for display (don't write)
+  local decayed
+  decayed=$(apply_decay)
+  read -r en se re ap bo <<< "$decayed"
+
+  # Apply serenity convergence from git state for display (inline to preserve _d_* detail vars)
+  local _serenity_result
+  _serenity_result=$(compute_serenity_from_git)
+  local _serenity_adj
+  read -r _serenity_adj _d_dirty_count _d_branch_count _d_merged_count _d_diff_insertions _d_diff_deletions _d_last_commit_ago _d_in_git_repo <<< "$_serenity_result"
+
+  if [ "$_d_in_git_repo" = "true" ]; then
+    local serenity_target=$((50 + _serenity_adj))
+    [ "$serenity_target" -lt 10 ] && serenity_target=10
+    [ "$serenity_target" -gt 95 ] && serenity_target=95
+    local distance=$((serenity_target - se))
+    local step=$(( (distance + (distance > 0 ? 2 : -2)) / 3 ))
+    if [ "$distance" -gt 0 ] && [ "$step" -lt 1 ]; then step=1; fi
+    if [ "$distance" -lt 0 ] && [ "$step" -gt -1 ]; then step=-1; fi
+    [ "$distance" -eq 0 ] && step=0
+    se=$(clamp $((se + step)))
+  fi
+
+  # Compute rest details for display (no drain applied — status is read-only)
+  local rest_result
+  rest_result=$(compute_rest_adjustment)
+  local rest_adj
+  read -r rest_adj _d_session_minutes _d_late_night_penalty _d_is_marathon _d_interaction_density <<< "$rest_result"
+
+  # Set detail variables for output_json
+  local last_fg fg_streak fgt
+  last_fg=$(json_val lastFoodGroup)
+  fg_streak=$(json_val foodGroupStreak)
+  fgt=$(json_val foodGroupsToday)
+  [ "$fgt" = "null" ] && fgt=""
+  _d_last_food_group="$last_fg"
+  _d_food_group_streak="${fg_streak:-0}"
+  _d_food_groups_today="$fgt"
+
+  local temped
+  temped=$(temporal_modifier "$en" "$se" "$re" "$ap" "$bo")
+  read -r en se re ap bo <<< "$temped"
+
+  local mood wb name streak lifetime
+  mood=$(resolve_mood "$en" "$se" "$re" "$ap" "$bo")
+  wb=$(wellbeing "$en" "$se" "$re" "$ap" "$bo")
+  name=$(json_val name)
+  streak=$(json_val streak)
+  lifetime=$(json_val lifetimeInteractions)
+
+  if [ "$mode" = "json" ]; then
+    output_json "$en" "$se" "$re" "$ap" "$bo" "$mood"
+    return
+  fi
+
+  local display_name="${name}"
+  [ "$display_name" = "null" ] || [ -z "$display_name" ] && display_name="Claude Mascot"
+
+  echo "╭─────────────────────────────╮"
+  printf "│  %-27s│\n" "$display_name"
+  echo "│─────────────────────────────│"
+  printf "│  Mood:      %-16s│\n" "$mood"
+  printf "│  Wellbeing: %-16s│\n" "$wb/100"
+  echo "│                             │"
+  printf "│  Energy:    %-5s" "$en"
+  local bar=""
+  local i=0
+  while [ $i -lt $((en / 10)) ]; do bar="${bar}█"; i=$((i + 1)); done
+  printf "%-11s│\n" "$bar"
+  printf "│  Serenity:  %-5s" "$se"
+  bar=""; i=0
+  while [ $i -lt $((se / 10)) ]; do bar="${bar}█"; i=$((i + 1)); done
+  printf "%-11s│\n" "$bar"
+  printf "│  Rest:      %-5s" "$re"
+  bar=""; i=0
+  while [ $i -lt $((re / 10)) ]; do bar="${bar}█"; i=$((i + 1)); done
+  printf "%-11s│\n" "$bar"
+  printf "│  Appetite:  %-5s" "$ap"
+  bar=""; i=0
+  while [ $i -lt $((ap / 10)) ]; do bar="${bar}█"; i=$((i + 1)); done
+  printf "%-11s│\n" "$bar"
+  printf "│  Bond:      %-5s" "$bo"
+  bar=""; i=0
+  while [ $i -lt $((bo / 10)) ]; do bar="${bar}█"; i=$((i + 1)); done
+  printf "%-11s│\n" "$bar"
+  echo "│                             │"
+  printf "│  Streak:    %-5s days      │\n" "${streak:-0}"
+  printf "│  Lifetime:  %-5s prompts   │\n" "${lifetime:-0}"
+  echo "╰─────────────────────────────╯"
+}
+
+cmd_reset() {
+  ensure_state
+  default_state > "$STATE_FILE"
+  echo "Mascot state reset to defaults."
+}
+
+cmd_feed() {
+  ensure_state
+  local decayed
+  decayed=$(apply_decay)
+  read -r en se re ap bo <<< "$decayed"
+  local boosted last_fg fg_streak
+  boosted=$(apply_event "feed" "$en" "$se" "$re" "$ap" "$bo")
+  read -r en se re ap bo last_fg fg_streak <<< "$boosted"
+  local mood
+  mood=$(resolve_mood "$en" "$se" "$re" "$ap" "$bo")
+  write_state "$en" "$se" "$re" "$ap" "$bo" "$mood" "$last_fg" "$fg_streak"
+  echo "Nom nom! Appetite is now $ap/100."
+}
+
+cmd_pet() {
+  ensure_state
+  local decayed
+  decayed=$(apply_decay)
+  read -r en se re ap bo <<< "$decayed"
+  local boosted last_fg fg_streak
+  boosted=$(apply_event "pet" "$en" "$se" "$re" "$ap" "$bo")
+  read -r en se re ap bo last_fg fg_streak <<< "$boosted"
+  local mood
+  mood=$(resolve_mood "$en" "$se" "$re" "$ap" "$bo")
+  write_state "$en" "$se" "$re" "$ap" "$bo" "$mood" "$last_fg" "$fg_streak"
+  echo "Hehe that tickles! Bond is now $bo/100."
+}
+
+cmd_rename() {
+  local new_name="$1"
+  if [ -z "$new_name" ]; then
+    echo "Usage: tamagotchi rename <name>"
+    exit 1
+  fi
+  ensure_state
+  sed -i '' "s/\"name\":.*/\"name\": \"$new_name\"/" "$STATE_FILE"
+  echo "Mascot renamed to: $new_name"
+}
+
+# --- System usage command ---
+cmd_usage() {
+  ensure_state
+
+  # Run system-monitor synchronously for a fresh sample
+  local monitor="${BASH_SOURCE[0]%/*}/system-monitor"
+  if [ -x "$monitor" ]; then
+    "$monitor" 2>/dev/null
+  fi
+
+  local system_file="${STATE_DIR}/system.json"
+  if [ ! -f "$system_file" ]; then
+    echo "No system data available. Run: ${monitor}"
+    return 1
+  fi
+
+  # Parse system.json — extract all metrics + top 3 CPU/RAM processes
+  eval "$(perl -e '
+    open my $fh, "<", $ARGV[0] or exit;
+    my $json = do { local $/; <$fh> };
+    close $fh;
+
+    my ($cpu, $ram, $disk, $gpu, $swap, $swap_pct, $swap_total) = (0, 0, 0, "", 0, 0, 0);
+    my ($ram_used, $ram_total) = (0, 0);
+
+    $cpu        = $1 if $json =~ /"cpu_pct"\s*:\s*(\d+)/;
+    $ram        = $1 if $json =~ /"ram_pct"\s*:\s*(\d+)/;
+    $ram_used   = $1 if $json =~ /"ram_used_gb"\s*:\s*([0-9.]+)/;
+    $ram_total  = $1 if $json =~ /"ram_total_gb"\s*:\s*([0-9.]+)/;
+    $disk       = $1 if $json =~ /"disk_pct"\s*:\s*(\d+)/;
+    $swap       = $1 if $json =~ /"swap_used_gb"\s*:\s*([0-9.]+)/;
+    $swap_pct   = $1 if $json =~ /"swap_pct"\s*:\s*(\d+)/;
+    $swap_total = $1 if $json =~ /"swap_total_gb"\s*:\s*([0-9.]+)/;
+    $gpu        = $1 if $json =~ /"gpu_pct"\s*:\s*(\d+)/;
+    $gpu = "" if $json =~ /"gpu_pct"\s*:\s*null/;
+
+    # Alerts
+    my @alerts;
+    if ($json =~ /"alerts"\s*:\s*\[([^\]]*)\]/) {
+      while ($1 =~ /"(\w+)"/g) { push @alerts, $1; }
+    }
+    my $alerts_str = join(",", @alerts);
+
+    # Top CPU processes (all 3)
+    my @cpu_procs;
+    while ($json =~ /\{"pct"\s*:\s*([0-9.]+)\s*,\s*"name"\s*:\s*"([^"]+)"\s*\}/g) {
+      push @cpu_procs, [$1, $2] if @cpu_procs < 3;
+    }
+    # Try alternate key order (name before pct)
+    if (!@cpu_procs) {
+      while ($json =~ /\{"name"\s*:\s*"([^"]+)"\s*,\s*"pct"\s*:\s*([0-9.]+)\s*\}/g) {
+        push @cpu_procs, [$2, $1] if @cpu_procs < 3;
+      }
+    }
+
+    # Top RAM processes (all 3) — have mem_mb field
+    my @ram_procs;
+    if ($json =~ /"top_ram"\s*:\s*(\[.*?\])/s) {
+      my $ram_arr = $1;
+      while ($ram_arr =~ /\{[^}]*?"name"\s*:\s*"([^"]+)"[^}]*?"mem_mb"\s*:\s*(\d+)[^}]*?\}/g) {
+        push @ram_procs, [$1, $2];
+      }
+      if (!@ram_procs) {
+        while ($ram_arr =~ /\{[^}]*?"mem_mb"\s*:\s*(\d+)[^}]*?"name"\s*:\s*"([^"]+)"[^}]*?\}/g) {
+          push @ram_procs, [$2, $1];
+        }
+      }
+    }
+
+    print "u_cpu=$cpu\n";
+    print "u_ram=$ram\n";
+    print "u_ram_used=$ram_used\n";
+    print "u_ram_total=$ram_total\n";
+    print "u_disk=$disk\n";
+    print "u_swap=$swap\n";
+    print "u_swap_pct=$swap_pct\n";
+    print "u_swap_total=$swap_total\n";
+    print "u_gpu=\"$gpu\"\n";
+    print "u_alerts=\"$alerts_str\"\n";
+
+    # Export top CPU (up to 3)
+    for my $i (0..2) {
+      my $pct  = defined $cpu_procs[$i] ? $cpu_procs[$i][0] : "";
+      my $name = defined $cpu_procs[$i] ? $cpu_procs[$i][1] : "";
+      my $n = $i + 1;
+      print "u_cpu${n}_name=\"$name\"\n";
+      print "u_cpu${n}_pct=\"$pct\"\n";
+    }
+    # Export top RAM (up to 3)
+    for my $i (0..2) {
+      my $name   = defined $ram_procs[$i] ? $ram_procs[$i][0] : "";
+      my $mem_mb = defined $ram_procs[$i] ? $ram_procs[$i][1] : "";
+      my $n = $i + 1;
+      print "u_ram${n}_name=\"$name\"\n";
+      print "u_ram${n}_mb=\"$mem_mb\"\n";
+    }
+    # Backward compat aliases for dashboard
+    print "u_cpu_hog=\"" . ($cpu_procs[0] ? $cpu_procs[0][1] : "") . "\"\n";
+    print "u_cpu_hog_pct=\"" . ($cpu_procs[0] ? $cpu_procs[0][0] : "") . "\"\n";
+    print "u_ram_hog=\"" . ($ram_procs[0] ? $ram_procs[0][0] : "") . "\"\n";
+    # Ram hog MB for dashboard display
+    print "u_ram_hog_mb=\"" . ($ram_procs[0] ? $ram_procs[0][1] : "") . "\"\n";
+  ' "$system_file")"
+
+  # Get current mood
+  local mood
+  mood=$(json_val currentMood)
+  mood=${mood:-NEUTRAL}
+
+  # ── ASCII dashboard ──
+  local bar_cpu bar_ram bar_disk
+  bar_cpu=""; bar_ram=""; bar_disk=""
+  local i=0
+  while [ $i -lt $((u_cpu / 10)) ]; do bar_cpu="${bar_cpu}█"; i=$((i + 1)); done
+  i=0
+  while [ $i -lt $((u_ram / 10)) ]; do bar_ram="${bar_ram}█"; i=$((i + 1)); done
+  i=0
+  while [ $i -lt $((u_disk / 10)) ]; do bar_disk="${bar_disk}█"; i=$((i + 1)); done
+
+  local name
+  name=$(json_val name)
+  local display_name="${name}"
+  [ "$display_name" = "null" ] || [ -z "$display_name" ] && display_name="Claude Mascot"
+
+  echo "╭──────────────────────────────╮"
+  printf "│  %-28s│\n" "$display_name — System"
+  echo "│──────────────────────────────│"
+  printf "│  CPU:  %3s%%  %-15s│\n" "$u_cpu" "$bar_cpu"
+  printf "│  RAM:  %3s%%  %-15s│\n" "$u_ram" "$bar_ram"
+  printf "│  Disk: %3s%%  %-15s│\n" "$u_disk" "$bar_disk"
+  printf "│  Swap: %3s%%  %-15s│\n" "$u_swap_pct" "(${u_swap}/${u_swap_total}GB)"
+  if [ -n "$u_gpu" ]; then
+    printf "│  GPU:  %3s%%                  │\n" "$u_gpu"
+  else
+    printf "│  GPU:  %-22s│\n" "n/a"
+  fi
+  echo "│                              │"
+  printf "│  Top CPU: %-18s│\n" "${u_cpu_hog} (${u_cpu_hog_pct}%)"
+  printf "│  Top RAM: %-18s│\n" "${u_ram_hog} (${u_ram_hog_mb}MB)"
+
+  # Alerts line
+  if [ -n "$u_alerts" ]; then
+    printf "│  Alerts: %-19s│\n" "$u_alerts"
+  else
+    printf "│  %-28s│\n" "All systems nominal"
+  fi
+  echo "╰──────────────────────────────╯"
+
+  # ── Generate personality message ──
+  local msg
+  msg=$(_usage_personality_message "$mood")
+
+  echo ""
+  echo "$msg"
+
+  # Dynamic duration: ~15 chars/sec reading speed, clamped 4–10s
+  local msg_len=${#msg}
+  local duration=$(( msg_len / 15 ))
+  [ "$duration" -lt 4 ] && duration=4
+  [ "$duration" -gt 10 ] && duration=10
+
+  # Fire toast with cooldown (300s) — dashboard always prints
+  local cooldown_file="${STATE_DIR}/.system-toast-cooldown"
+  local can_toast=true
+  if [ -f "$cooldown_file" ]; then
+    local last_ts now_ts
+    last_ts=$(cat "$cooldown_file")
+    now_ts=$(date +%s)
+    [ $(( now_ts - last_ts )) -lt 300 ] && can_toast=false
+  fi
+  if [ "$can_toast" = true ]; then
+    local toast_script="${BASH_SOURCE[0]%/*}/toast"
+    if [ -x "$toast_script" ]; then
+      "$toast_script" --mode done --mood "$mood" "$msg" "$duration" &
+      disown
+    fi
+    date +%s > "$cooldown_file"
+  fi
+}
+
+# Generate a personality-driven system message with smart investigation.
+# Reads u_* vars from outer scope (set by cmd_usage's perl parser).
+_usage_personality_message() {
+  local mood="$1"
+  local alerts="$u_alerts"
+
+  # No alerts — all good
+  if [ -z "$alerts" ]; then
+    echo "All clear — nothing flagged."
+    return
+  fi
+
+  # ── Build investigation description based on alert types ──
+  local desc=""
+  local alert_count=0
+  local part=""
+  IFS="," read -ra _alert_arr <<< "$alerts"
+
+  for _a in "${_alert_arr[@]}"; do
+    part=""
+    case "$_a" in
+      cpu)
+        # Name all 3 top CPU processes with %
+        local cpu_parts="${u_cpu1_name} (${u_cpu1_pct}%)"
+        [ -n "$u_cpu2_name" ] && cpu_parts="${cpu_parts}, ${u_cpu2_name} (${u_cpu2_pct}%)"
+        [ -n "$u_cpu3_name" ] && cpu_parts="${cpu_parts}, and ${u_cpu3_name} (${u_cpu3_pct}%)"
+        part="${cpu_parts} are eating your CPU"
+        ;;
+      ram)
+        # Name top 2-3 RAM processes with MB→GB
+        local ram_parts=""
+        if [ -n "$u_ram1_name" ] && [ -n "$u_ram1_mb" ]; then
+          local r1_gb=$(perl -e "printf '%.1f', $u_ram1_mb / 1024" 2>/dev/null)
+          ram_parts="${u_ram1_name} (${r1_gb}GB)"
+        fi
+        if [ -n "$u_ram2_name" ] && [ -n "$u_ram2_mb" ]; then
+          local r2_gb=$(perl -e "printf '%.1f', $u_ram2_mb / 1024" 2>/dev/null)
+          ram_parts="${ram_parts} and ${u_ram2_name} (${r2_gb}GB)"
+        fi
+        if [ -n "$ram_parts" ]; then
+          part="${ram_parts} are the biggest memory hogs"
+        else
+          part="RAM is at ${u_ram}%"
+        fi
+        ;;
+      swap)
+        # Correlate with top RAM processes — swap is caused by RAM pressure
+        local swap_detail="Swap is at ${u_swap_pct}% (${u_swap}GB)"
+        if [ -n "$u_ram1_name" ] && [ -n "$u_ram1_mb" ]; then
+          local sr1_gb=$(perl -e "printf '%.1f', $u_ram1_mb / 1024" 2>/dev/null)
+          swap_detail="${swap_detail} — RAM is nearly full. ${u_ram1_name} (${sr1_gb}GB)"
+          if [ -n "$u_ram2_name" ] && [ -n "$u_ram2_mb" ]; then
+            local sr2_gb=$(perl -e "printf '%.1f', $u_ram2_mb / 1024" 2>/dev/null)
+            swap_detail="${swap_detail} and ${u_ram2_name} (${sr2_gb}GB) are the heaviest"
+          else
+            swap_detail="${swap_detail} is the heaviest"
+          fi
+          swap_detail="${swap_detail}. Quitting one would help"
+        fi
+        part="$swap_detail"
+        ;;
+      disk)
+        part="Disk is at ${u_disk}%. Check ~/Library/Caches and ~/Downloads for easy wins"
+        ;;
+      gpu)
+        local gpu_culprit="${u_cpu1_name:-something}"
+        part="GPU is at ${u_gpu}%. Probably ${gpu_culprit} — check Activity Monitor"
+        ;;
+    esac
+    if [ -n "$part" ]; then
+      [ -n "$desc" ] && desc="${desc}. Also, "
+      desc="${desc}${part}"
+      alert_count=$((alert_count + 1))
+    fi
+    # For multi-alert, combine the top 2
+    [ "$alert_count" -ge 2 ] && break
+  done
+
+  echo "${desc}."
+}
+
+# --- Main ---
+CMD="${1:-status}"
+shift || true
+
+case "$CMD" in
+  update)
+    EVENT="prompt"
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --event) EVENT="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    cmd_update "$EVENT"
+    ;;
+  status)
+    cmd_status "$@"
+    ;;
+  reset)
+    cmd_reset
+    ;;
+  feed)
+    cmd_feed
+    ;;
+  pet)
+    cmd_pet
+    ;;
+  rename)
+    cmd_rename "${1:-}"
+    ;;
+  config)
+    cmd_config "$@"
+    ;;
+  usage)
+    cmd_usage
+    ;;
+  *)
+    echo "Usage: tamagotchi {update|status|reset|feed|pet|rename|config|usage} [options]"
+    echo ""
+    echo "Commands:"
+    echo "  update --event <type>  Update stats (task_complete|prompt|code_change|test_run|lint_run|docs_change|refactor|...)"
+    echo "  status [--json]        Show current stats (ASCII dashboard or JSON snapshot)"
+    echo "  reset                  Reset to defaults"
+    echo "  feed                   Feed the mascot (+appetite)"
+    echo "  pet                    Pet the mascot (+bond)"
+    echo "  rename <name>          Give it a name"
+    echo "  config get             Show config JSON"
+    echo "  config repo-roots      List configured repo roots"
+    echo "  config repo-roots --add <path>    Add a repo root"
+    echo "  config repo-roots --remove <path> Remove a repo root"
+    echo "  config repo-roots --scan          Scan roots for .claude/git status"
+    echo "  usage                  Show system resource usage with personality"
+    exit 1
+    ;;
+esac

@@ -1,0 +1,15 @@
+# Build artifacts
+menubar/.build/
+menubar/build/
+
+# macOS
+.DS_Store
+
+# Claude Code local settings
+.claude/
+
+# Editor
+*.swp
+*~
+.vscode/
+.idea/

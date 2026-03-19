@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# ──────────────────────────────────────────────────────────────
+# System Resource Monitor — macOS metrics collector
+#
+# Collects CPU, RAM, swap, disk, GPU (best-effort), and top
+# processes. Writes JSON cache to ~/.config/claude-mascot/system.json.
+# No sudo required. Designed for background invocation from statusline.
+#
+# Usage: system-monitor
+# ──────────────────────────────────────────────────────────────
+set -euo pipefail
+
+CONTEXT_DIR="${HOME}/.config/claude-mascot"
+SYSTEM_FILE="${CONTEXT_DIR}/system.json"
+
+mkdir -p "$CONTEXT_DIR"
+
+# ── Thresholds ────────────────────────────────────────────────
+THRESH_CPU=80
+THRESH_RAM=85
+THRESH_SWAP_PCT=70
+THRESH_DISK=90
+THRESH_GPU=85
+
+# ── CPU % ─────────────────────────────────────────────────────
+# top -l 2 takes two samples (~1s); second sample gives accurate CPU
+# Output line: "CPU usage: 12.34% user, 5.67% sys, 81.99% idle"
+collect_cpu() {
+  local idle cpu_pct top_out
+  # Capture full top output first, then extract (avoids SIGPIPE)
+  top_out=$(top -l 2 -n 0 -s 1 2>/dev/null || true)
+  idle=$(echo "$top_out" | grep "^CPU usage" | tail -1 | perl -ne 'print $1 if /([0-9.]+)% idle/')
+  if [ -n "$idle" ]; then
+    cpu_pct=$(perl -e "printf '%.0f', 100 - $idle")
+  else
+    cpu_pct=0
+  fi
+  echo "$cpu_pct"
+}
+
+# ── RAM ───────────────────────────────────────────────────────
+# vm_stat gives page counts; sysctl gives total physical memory
+collect_ram() {
+  local page_size total_bytes
+  page_size=$(vm_stat 2>/dev/null | perl -ne 'print $1 if /page size of (\d+)/')
+  page_size=${page_size:-16384}
+  total_bytes=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+
+  # Parse vm_stat pages
+  local free inactive speculative purgeable
+  local vm_out
+  vm_out=$(vm_stat 2>/dev/null)
+  free=$(echo "$vm_out" | perl -ne 'print $1 if /Pages free:\s+(\d+)/')
+  inactive=$(echo "$vm_out" | perl -ne 'print $1 if /Pages inactive:\s+(\d+)/')
+  speculative=$(echo "$vm_out" | perl -ne 'print $1 if /Pages speculative:\s+(\d+)/')
+  purgeable=$(echo "$vm_out" | perl -ne 'print $1 if /Pages purgeable:\s+(\d+)/')
+
+  free=${free:-0}
+  inactive=${inactive:-0}
+  speculative=${speculative:-0}
+  purgeable=${purgeable:-0}
+
+  # Available ≈ free + inactive + speculative + purgeable (conservative)
+  local available_pages=$(( free + inactive + speculative + purgeable ))
+  local available_bytes=$(( available_pages * page_size ))
+  local used_bytes=$(( total_bytes - available_bytes ))
+
+  # Prevent negative used (shouldn't happen but be safe)
+  [ "$used_bytes" -lt 0 ] && used_bytes=0
+
+  local total_gb used_gb ram_pct
+  total_gb=$(perl -e "printf '%.1f', $total_bytes / 1073741824")
+  used_gb=$(perl -e "printf '%.1f', $used_bytes / 1073741824")
+  if [ "$total_bytes" -gt 0 ]; then
+    ram_pct=$(perl -e "printf '%.0f', ($used_bytes / $total_bytes) * 100")
+  else
+    ram_pct=0
+  fi
+
+  echo "$ram_pct $used_gb $total_gb"
+}
+
+# ── Swap ──────────────────────────────────────────────────────
+# Returns: swap_pct swap_used_gb swap_total_gb
+collect_swap() {
+  local swap_line swap_used_bytes swap_total_bytes swap_pct swap_used_gb swap_total_gb
+  swap_line=$(sysctl -n vm.swapusage 2>/dev/null || true)
+
+  eval "$(echo "$swap_line" | perl -ne '
+    my ($total, $used) = (0, 0);
+    if (/total\s*=\s*([0-9.]+)([MG])/) {
+      $total = $1;
+      $total *= 1073741824 if $2 eq "G";
+      $total *= 1048576 if $2 eq "M";
+    }
+    if (/used\s*=\s*([0-9.]+)([MG])/) {
+      $used = $1;
+      $used *= 1073741824 if $2 eq "G";
+      $used *= 1048576 if $2 eq "M";
+    }
+    my $pct = ($total > 0) ? sprintf("%.0f", ($used / $total) * 100) : 0;
+    my $used_gb = sprintf("%.1f", $used / 1073741824);
+    my $total_gb = sprintf("%.1f", $total / 1073741824);
+    print "swap_pct=$pct swap_used_gb=$used_gb swap_total_gb=$total_gb\n";
+  ')"
+
+  swap_pct=${swap_pct:-0}
+  swap_used_gb=${swap_used_gb:-0.0}
+  swap_total_gb=${swap_total_gb:-0.0}
+  echo "$swap_pct $swap_used_gb $swap_total_gb"
+}
+
+# ── Disk % ────────────────────────────────────────────────────
+collect_disk() {
+  local disk_pct
+  disk_pct=$(df / 2>/dev/null | tail -1 | perl -ne 'print $1 if /(\d+)%/')
+  disk_pct=${disk_pct:-0}
+  echo "$disk_pct"
+}
+
+# ── GPU % (best-effort) ──────────────────────────────────────
+collect_gpu() {
+  local gpu_pct ioreg_out
+  # ioreg can expose GPU utilization on some Macs
+  # Capture full output first to avoid SIGPIPE with pipefail
+  ioreg_out=$(ioreg -r -d 1 -c IOAccelerator 2>/dev/null || true)
+  gpu_pct=$(echo "$ioreg_out" | perl -ne '
+    if (/"GPU Core Utilization"\s*=\s*(\d+)/) { $r = int($1 * 100 / 100) }
+    if (/"Device Utilization %"\s*=\s*(\d+)/) { $r = $1 }
+    if (/"gpu-core-utilization"\s*=\s*(\d+)/) { $r = $1 }
+    END { print $r if defined $r }
+  ' 2>/dev/null || true)
+  # Return empty if we couldn't get GPU data
+  echo "${gpu_pct:-}"
+}
+
+# ── Top processes ─────────────────────────────────────────────
+# Returns JSON array of top 3 by CPU or RAM
+# Format: [{"pct":45.2,"name":"Chrome"},...]
+collect_top_cpu() {
+  # Consume all ps output in perl to avoid SIGPIPE with pipefail
+  ps axo pcpu,comm -r 2>/dev/null | perl -e '
+    my @lines = <STDIN>;  # consume all input
+    shift @lines;          # skip header
+    my @procs;
+    for my $i (0..2) {
+      last unless defined $lines[$i];
+      my $line = $lines[$i];
+      $line =~ s/^\s+//;
+      my ($pct, $name) = split /\s+/, $line, 2;
+      chomp $name;
+      $name =~ s|.*/||;
+      $name = substr($name, 0, 20);
+      $name =~ s/"/\\"/g;
+      push @procs, "{\"pct\":$pct,\"name\":\"$name\"}";
+    }
+    print "[" . join(",", @procs) . "]";
+  '
+}
+
+collect_top_ram() {
+  ps axo pmem,rss,comm -m 2>/dev/null | perl -e '
+    my @lines = <STDIN>;
+    shift @lines;
+    my @procs;
+    for my $i (0..2) {
+      last unless defined $lines[$i];
+      my $line = $lines[$i];
+      $line =~ s/^\s+//;
+      my ($pct, $rss_kb, $name) = split /\s+/, $line, 3;
+      chomp $name;
+      $name =~ s|.*/||;
+      $name = substr($name, 0, 20);
+      $name =~ s/"/\\"/g;
+      my $mem_mb = int($rss_kb / 1024);
+      push @procs, "{\"pct\":$pct,\"mem_mb\":$mem_mb,\"name\":\"$name\"}";
+    }
+    print "[" . join(",", @procs) . "]";
+  '
+}
+
+# ── Collect everything ────────────────────────────────────────
+
+cpu_pct=$(collect_cpu)
+read -r ram_pct ram_used_gb ram_total_gb <<< "$(collect_ram)"
+read -r swap_pct swap_used_gb swap_total_gb <<< "$(collect_swap)"
+disk_pct=$(collect_disk)
+gpu_pct=$(collect_gpu)
+top_cpu=$(collect_top_cpu)
+top_ram=$(collect_top_ram)
+
+# ── Build alerts array ────────────────────────────────────────
+alerts=()
+[ "$cpu_pct" -gt "$THRESH_CPU" ] 2>/dev/null && alerts+=("cpu")
+[ "$ram_pct" -gt "$THRESH_RAM" ] 2>/dev/null && alerts+=("ram")
+[ "$swap_pct" -gt "$THRESH_SWAP_PCT" ] 2>/dev/null && alerts+=("swap")
+[ "$disk_pct" -gt "$THRESH_DISK" ] 2>/dev/null && alerts+=("disk")
+if [ -n "$gpu_pct" ]; then
+  [ "$gpu_pct" -gt "$THRESH_GPU" ] 2>/dev/null && alerts+=("gpu")
+fi
+
+# Build alerts JSON array
+alerts_json="["
+for i in "${!alerts[@]}"; do
+  [ "$i" -gt 0 ] && alerts_json="${alerts_json},"
+  alerts_json="${alerts_json}\"${alerts[$i]}\""
+done
+alerts_json="${alerts_json}]"
+
+# GPU JSON value
+gpu_json="null"
+[ -n "$gpu_pct" ] && gpu_json="$gpu_pct"
+
+# Timestamp
+sampled_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# ── Write atomically ─────────────────────────────────────────
+tmp_file=$(mktemp "${CONTEXT_DIR}/.system.XXXXXX")
+cat > "$tmp_file" <<ENDJSON
+{
+  "cpu_pct": ${cpu_pct},
+  "ram_pct": ${ram_pct},
+  "ram_used_gb": ${ram_used_gb},
+  "ram_total_gb": ${ram_total_gb},
+  "swap_pct": ${swap_pct},
+  "swap_used_gb": ${swap_used_gb},
+  "swap_total_gb": ${swap_total_gb},
+  "disk_pct": ${disk_pct},
+  "gpu_pct": ${gpu_json},
+  "top_cpu": ${top_cpu},
+  "top_ram": ${top_ram},
+  "alerts": ${alerts_json},
+  "sampled_at": "${sampled_at}"
+}
+ENDJSON
+mv -f "$tmp_file" "$SYSTEM_FILE"

@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+# ──────────────────────────────────────────────────────────────
+# Claude Code Usage Scraper
+#
+# Manages a background tmux session running Claude Code, sends
+# /usage to scrape plan usage data, parses the output, computes
+# pace indicators, and caches to ~/.config/claude-mascot/usage.json.
+#
+# Prerequisites: tmux (brew install tmux), claude CLI
+# ──────────────────────────────────────────────────────────────
+set -euo pipefail
+
+CONTEXT_DIR="${HOME}/.config/claude-mascot"
+USAGE_FILE="${CONTEXT_DIR}/usage.json"
+LOCK_FILE="${CONTEXT_DIR}/.usage-scraper.lock"
+TMUX_SESSION="claude-usage"
+MAX_SESSION_AGE=14400  # 4 hours — rotate before degradation sets in
+
+# ── Guard: tmux and claude must be available ─────────────────
+command -v tmux  >/dev/null 2>&1 || exit 0
+command -v claude >/dev/null 2>&1 || exit 0
+
+mkdir -p "$CONTEXT_DIR"
+
+# ── Lock: prevent concurrent runs ────────────────────────────
+# Use mkdir as an atomic lock (portable, no flock on macOS by default)
+if ! mkdir "$LOCK_FILE" 2>/dev/null; then
+  # Check if the lock is stale (> 60 seconds old)
+  if [ -d "$LOCK_FILE" ]; then
+    lock_age=$(( $(date +%s) - $(stat -f %m "$LOCK_FILE" 2>/dev/null || echo 0) ))
+    if [ "$lock_age" -gt 60 ]; then
+      rm -rf "$LOCK_FILE"
+      mkdir "$LOCK_FILE" 2>/dev/null || exit 0
+    else
+      exit 0
+    fi
+  else
+    exit 0
+  fi
+fi
+
+# Ensure lock is removed on exit
+cleanup() { rm -rf "$LOCK_FILE"; }
+trap cleanup EXIT
+
+# ── Session management ───────────────────────────────────────
+kill_session() {
+  tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+  sleep 1
+}
+
+ensure_session() {
+  if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    local created now age
+    created=$(tmux display-message -t "$TMUX_SESSION" -p '#{session_created}' 2>/dev/null || echo 0)
+    now=$(date +%s)
+    age=$(( now - created ))
+    if [ "$age" -lt "$MAX_SESSION_AGE" ]; then
+      return 0
+    fi
+    # Session too old — kill and fall through to creation
+    kill_session
+  fi
+
+  tmux new-session -d -s "$TMUX_SESSION" -x 120 -y 40 "claude --name usage-probe"
+  sleep 10
+}
+
+# ── Send /usage and capture output ───────────────────────────
+scrape_usage() {
+  # Clear the pane first to get clean output
+  tmux send-keys -t "$TMUX_SESSION" "" ""
+  sleep 0.5
+
+  # Send /usage command
+  tmux send-keys -t "$TMUX_SESSION" "/usage" Enter
+
+  # Poll until actual usage data appears (up to 15 seconds)
+  local raw="" attempts=0
+  while [ "$attempts" -lt 30 ]; do
+    sleep 0.5
+    raw=$(tmux capture-pane -t "$TMUX_SESSION" -p -S -40)
+    # Check if real data has loaded (percentage lines present)
+    if echo "$raw" | grep -q '%.*used'; then
+      break
+    fi
+    attempts=$((attempts + 1))
+  done
+
+  # Dismiss the /usage overlay by pressing Escape
+  tmux send-keys -t "$TMUX_SESSION" Escape
+  sleep 0.5
+
+  echo "$raw"
+}
+
+# ── Parse usage data from raw output ─────────────────────────
+parse_usage() {
+  local raw="$1"
+
+  # Strip ANSI escape codes and parse all fields with a single perl pass
+  echo "$raw" | perl -e '
+    use POSIX qw(mktime);
+
+    my $text = do { local $/; <STDIN> };
+    # Strip ANSI codes
+    $text =~ s/\e\[[0-9;]*[a-zA-Z]//g;
+    $text =~ s/\e\][\d;]*[^\a]*\a//g;
+
+    my ($sess_pct, $sess_resets) = ("", "");
+    my ($week_pct, $week_resets) = ("", "");
+    my ($extra_spent, $extra_budget) = ("", "");
+
+    # Parse sections by looking for headers followed by percentage lines
+    my @lines = split /\n/, $text;
+    my $section = "";
+
+    for (my $i = 0; $i < scalar @lines; $i++) {
+      my $line = $lines[$i];
+
+      if ($line =~ /Current session/i) {
+        $section = "session";
+      } elsif ($line =~ /Current week \(all models\)/i) {
+        $section = "week_all";
+      } elsif ($line =~ /Current week \(Sonnet/i) {
+        $section = "week_sonnet";
+      } elsif ($line =~ /Extra usage/i) {
+        $section = "extra";
+      }
+
+      # Match percentage lines (with or without progress bar)
+      if ($line =~ /(\d+)%\s*used/) {
+        my $pct = $1;
+        if ($section eq "session") {
+          $sess_pct = $pct;
+        } elsif ($section eq "week_all") {
+          $week_pct = $pct;
+        }
+        # We skip week_sonnet
+      }
+
+      # Match reset times — handles both "2pm" and "2:59pm" formats
+      # Session: "Resets 2pm (Europe/Zurich)" or "Resets 2:59pm (Europe/Zurich)"
+      if ($section eq "session" && $line =~ /Resets\s+(\d+(?::\d+)?(?:am|pm))/i) {
+        $sess_resets = $1;
+      }
+      # Week: "Resets Mar 23 at 10am (Europe/Zurich)" or "Resets Mar 16 at 9:59am (Europe/Zurich)"
+      if ($section eq "week_all" && $line =~ /Resets\s+((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d+\s+at\s+\d+(?::\d+)?(?:am|pm))/i) {
+        $week_resets = $1;
+      }
+
+      # Extra: "$15.21 / $15.00 spent"
+      if ($section eq "extra" && $line =~ /\$([0-9.]+)\s*\/\s*\$([0-9.]+)\s*spent/i) {
+        $extra_spent = $1;
+        $extra_budget = $2;
+      }
+    }
+
+    # ── Compute pace (elapsed percentage of each period) ──
+
+    my $now = time();
+    my $sess_elapsed_pct = "";
+    my $week_elapsed_pct = "";
+
+    # Session pace: 5-hour window, reset time is end of window
+    # Handles "2pm", "2:59pm", "10am", "10:30am"
+    if ($sess_resets =~ /^(\d+)(?::(\d+))?(am|pm)$/i) {
+      my ($h, $m, $ampm) = ($1, $2 // 0, lc($3));
+      $h = $h % 12;
+      $h += 12 if $ampm eq "pm";
+
+      # Build reset timestamp for today
+      my @lt = localtime($now);
+      my $reset_time = mktime(0, $m, $h, $lt[3], $lt[4], $lt[5]);
+
+      # If reset is in the past, it might be tomorrow
+      if ($reset_time < $now - 300) {
+        $reset_time += 86400;
+      }
+
+      my $start_time = $reset_time - (5 * 3600);  # 5 hours before reset
+      if ($now >= $start_time && $now <= $reset_time) {
+        my $elapsed = $now - $start_time;
+        my $period = 5 * 3600;
+        $sess_elapsed_pct = int(($elapsed / $period) * 100);
+      }
+    }
+
+    # Week pace: 7-day window, reset time is end of window
+    # Handles "Mar 23 at 10am", "Mar 16 at 9:59am"
+    if ($week_resets =~ /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d+)\s+at\s+(\d+)(?::(\d+))?(am|pm)$/i) {
+      my %months = (Jan=>0, Feb=>1, Mar=>2, Apr=>3, May=>4, Jun=>5,
+                    Jul=>6, Aug=>7, Sep=>8, Oct=>9, Nov=>10, Dec=>11);
+      my ($mon, $day, $h, $m, $ampm) = ($1, $2, $3, $4 // 0, lc($5));
+      $h = $h % 12;
+      $h += 12 if $ampm eq "pm";
+
+      my @lt = localtime($now);
+      my $year = $lt[5];  # years since 1900
+      my $reset_time = mktime(0, $m, $h, $day, $months{$mon}, $year);
+
+      # If reset is far in the past, might be next year (unlikely but safe)
+      if ($reset_time < $now - 7 * 86400) {
+        $reset_time = mktime(0, $m, $h, $day, $months{$mon}, $year + 1);
+      }
+
+      my $start_time = $reset_time - (7 * 86400);  # 7 days before reset
+      if ($now >= $start_time && $now <= $reset_time) {
+        my $elapsed = $now - $start_time;
+        my $period = 7 * 86400;
+        $week_elapsed_pct = int(($elapsed / $period) * 100);
+      }
+    }
+
+    # ── Output JSON ──
+    my $scraped_at = `date -u +"%Y-%m-%dT%H:%M:%SZ"`;
+    chomp $scraped_at;
+
+    # Build JSON manually (no jq dependency)
+    print "{\n";
+    print "  \"session_pct\": " . ($sess_pct ne "" ? $sess_pct : "null") . ",\n";
+    print "  \"session_resets\": " . ($sess_resets ne "" ? "\"$sess_resets\"" : "null") . ",\n";
+    print "  \"session_elapsed_pct\": " . ($sess_elapsed_pct ne "" ? $sess_elapsed_pct : "null") . ",\n";
+    print "  \"week_all_pct\": " . ($week_pct ne "" ? $week_pct : "null") . ",\n";
+    print "  \"week_all_resets\": " . ($week_resets ne "" ? "\"$week_resets\"" : "null") . ",\n";
+    print "  \"week_all_elapsed_pct\": " . ($week_elapsed_pct ne "" ? $week_elapsed_pct : "null") . ",\n";
+    print "  \"extra_spent\": " . ($extra_spent ne "" ? $extra_spent : "null") . ",\n";
+    print "  \"extra_budget\": " . ($extra_budget ne "" ? $extra_budget : "null") . ",\n";
+    print "  \"scraped_at\": \"$scraped_at\"\n";
+    print "}\n";
+  '
+}
+
+# ── Main ─────────────────────────────────────────────────────
+
+ensure_session
+
+raw=$(scrape_usage)
+json=$(parse_usage "$raw")
+has_data=$(echo "$json" | perl -ne 'print "yes" if /"session_pct":\s*\d/ || /"week_all_pct":\s*\d/')
+
+# Retry once with a fresh session if scrape failed
+if [ -z "$has_data" ]; then
+  kill_session
+  ensure_session
+  raw=$(scrape_usage)
+  json=$(parse_usage "$raw")
+  has_data=$(echo "$json" | perl -ne 'print "yes" if /"session_pct":\s*\d/ || /"week_all_pct":\s*\d/')
+fi
+
+if [ -n "$has_data" ]; then
+  tmp_file=$(mktemp "${CONTEXT_DIR}/.usage.XXXXXX")
+  echo "$json" > "$tmp_file"
+  mv -f "$tmp_file" "$USAGE_FILE"
+fi
