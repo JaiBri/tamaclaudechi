@@ -6,10 +6,15 @@ menubar/build/
 .DS_Store
 
 # Claude Code local settings
-.claude/
+.claude/settings.local.json
 
 # Editor
 *.swp
 *~
 .vscode/
 .idea/
+
+# Secrets
+.env
+.env.*
+!.env.example

@@ -1,6 +1,7 @@
 ---
 created: 2026-03-13
-updated: 2026-03-13
+updated: 2026-03-20
+description: "SwiftUI menu bar app — build, install, polling, and watcher architecture"
 ---
 # Menu Bar Companion
 
@@ -8,10 +9,11 @@ Location: `menubar/`
 
 ## Features
 
-- SwiftUI `MenuBarExtra` that reads `status --json` from the CLI.
+- SwiftUI `MenuBarExtra` that reads `status --json` from the [[Instructions/Tamagotchi CLI]].
 - 60s polling + `DispatchSource` watcher on `~/.config/claude-mascot/state.json` for instant refreshes.
 - Quick actions (Feed/Pet) proxy to the CLI so streaks/achievements stay accurate.
 - Mood badge + stat bars mirror the Tamagotchi data model.
+- The Brain bar consumes `context.json` written by the [[Instructions/Status Line]].
 
 ## Dev Commands
 
@@ -33,3 +35,11 @@ swift build -c release             # Compile binary in .build/release/
 - `Sources/TamagotchiMenuBar/main.swift` — SwiftUI entry point, view model, watchers, and UI.
 - `build-app.sh` — helper to produce `TamagotchiMenuBar.app`.
 - `install-login-item.sh` — adds/removes the login item.
+
+---
+
+## See Also
+
+- [[Architecture/System Overview]] — polling and watcher architecture
+- [[Instructions/Tamagotchi CLI]] — CLI commands proxied by quick actions
+- [[Instructions/Status Line]] — context.json consumed for Brain bar

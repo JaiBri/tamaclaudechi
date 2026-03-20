@@ -62,7 +62,7 @@ ensure_session() {
     kill_session
   fi
 
-  tmux new-session -d -s "$TMUX_SESSION" -x 120 -y 40 "claude --name usage-probe"
+  tmux new-session -d -s "$TMUX_SESSION" -x 120 -y 40 "claude --name usage-probe --model haiku"
   sleep 10
 }
 

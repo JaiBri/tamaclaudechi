@@ -6,9 +6,9 @@ Tamaclaudechi — a living coding companion for Claude Code. A pixel-art mascot 
 
 ## Components
 
-- **State engine** (`scripts/tamagotchi`) — Bash CLI that manages 5 stats, mood cascades, achievements, decay, and JSON output. All state mutations flow through this.
-- **Toast overlay** (`scripts/toast`) — macOS WebView toast with mood-aware visuals, particles, and speech bubbles.
-- **Status line** (`scripts/statusline`) — Bridges Claude Code context metrics + API usage into the menu bar.
+- **State engine** (`scripts/tamagotchi` + `scripts/lib/`, `scripts/core/`, `scripts/commands/`) — Modular Bash CLI managing 5 stats, mood cascades, achievements, decay, and JSON output. Thin router sources shared helpers, engine logic, and command implementations. All state mutations flow through this.
+- **Toast overlay** (`scripts/toast` + `scripts/toast-assets/`) — macOS WebView toast with mood-aware visuals, particles, and speech bubbles. HTML template and Swift controller extracted to `toast-assets/`.
+- **Status line** (`scripts/statusline` + `scripts/statusline-sections/`) — Bridges Claude Code context metrics + API usage into the menu bar. Section renderers extracted to `statusline-sections/`.
 - **Usage scraper** (`scripts/usage-scraper`) — Background tmux session that polls `/usage` from Claude Code.
 - **System monitor** (`scripts/system-monitor`) — macOS resource collector (CPU/RAM/disk/GPU).
 - **Menu bar app** (`menubar/`) — SwiftUI companion that shows live stats, activity strip, and quick actions.
@@ -20,6 +20,7 @@ Tamaclaudechi — a living coding companion for Claude Code. A pixel-art mascot 
 ./scripts/tamagotchi status              # ASCII dashboard
 ./scripts/tamagotchi status --json       # JSON snapshot
 ./scripts/tamagotchi update --event X    # Mutate state + return JSON
+./scripts/tamagotchi diagnose           # Run diagnostics (hooks, state, logs, sources)
 
 # Menu bar
 cd menubar && swift run                  # Debug build + launch

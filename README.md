@@ -102,12 +102,12 @@ Add to your **user-level** `~/.claude/settings.json`:
 | **Energy** | Time of day (circadian curve) | Blends toward circadian target |
 | **Serenity** | Repo tidiness (git state) | -1/hr |
 | **Rest** | Healthy work patterns | +2/hr idle (recovers!), caps at 80 |
-| **Appetite** | Work variety (food groups) | -4/hr (fastest) |
 | **Bond** | Relationship consistency | -0.5/hr (slowest) |
+| **Vitality** | System health (CPU/RAM/disk/swap) | Converges toward system target |
 
 ## Moods
 
-Priority cascade: SLEEPING > SLEEPY > ANXIOUS > CONCERNED > STARVING > LONELY > SAD > HUNGRY > EXCITED > ECSTATIC > HAPPY > TIRED > NEUTRAL.
+Priority cascade: SLEEPING > SLEEPY > ANXIOUS > CONCERNED > LONELY > STRESSED > SAD > EXCITED > ECSTATIC > HAPPY > TIRED > NEUTRAL.
 
 Each mood has unique breathing animations, CSS filters, particle effects, and personality directives.
 
@@ -117,10 +117,10 @@ Each mood has unique breathing animations, CSS filters, particle effects, and pe
 ./scripts/tamagotchi status              # ASCII dashboard
 ./scripts/tamagotchi status --json       # JSON snapshot (no state mutation)
 ./scripts/tamagotchi update --event X    # Apply decay + event boost, return JSON
-./scripts/tamagotchi feed                # Manual appetite boost
 ./scripts/tamagotchi pet                 # Manual +5 bond
 ./scripts/tamagotchi rename <name>       # Give it a name
 ./scripts/tamagotchi reset               # Reset to defaults
+./scripts/tamagotchi diagnose           # Run diagnostics
 ```
 
 ## Menu Bar Companion
@@ -152,9 +152,14 @@ Persisted at `~/.config/claude-mascot/state.json` (user-level, follows across re
 ## Files
 
 ```
-scripts/tamagotchi       State engine CLI (bash)
-scripts/toast            WebView toast overlay (bash + HTML + Swift)
-scripts/statusline       Claude Code status line bridge
+scripts/tamagotchi       State engine CLI — thin router
+scripts/lib/             Shared helpers (JSON, time, math)
+scripts/core/            Engine logic (state, decay, events, mood, serenity)
+scripts/commands/        CLI commands (update, status, reset, pet, config, usage)
+scripts/toast            WebView toast overlay — wrapper
+scripts/toast-assets/    HTML template + Swift WebView controller
+scripts/statusline       Status line bridge — main script
+scripts/statusline-sections/  Section renderers (git, usage, system, session)
 scripts/usage-scraper    tmux-based /usage scraper
 scripts/system-monitor   macOS system resource collector
 menubar/                 SwiftUI menu bar companion

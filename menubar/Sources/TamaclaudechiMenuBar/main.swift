@@ -71,22 +71,7 @@ struct MoodAnimationConfig {
                             ("z", 3, .drift, 8, 2.0, -0.5, 12, nil),
                             ("\u{2604}", 1, .float, 2, 4.0, -0.4, 10, nil),
                          ])
-        case "HUNGRY":
-            return .init(bounceAmplitude: 0.5, bounceFrequency: 1.5, rotationAmplitude: 0.08, rotationFrequency: 3.5,
-                         scaleAmplitude: 0, scaleFrequency: 0,
-                         particles: [
-                            ("\u{1F374}", 2, .float, 5, 2.5, -0.3, 12, nil),
-                            ("?", 2, .up, 8, 2.0, -0.5, 12, nil),
-                         ])
-        case "STARVING":
-            return .init(bounceAmplitude: 1.5, bounceFrequency: 5.0, rotationAmplitude: 0.12, rotationFrequency: 6.0,
-                         scaleAmplitude: 0, scaleFrequency: 0,
-                         particles: [
-                            ("!", 3, .down, 16, 1.0, -0.3, 14, .red),
-                            ("\u{1F525}", 2, .up, 12, 1.3, -0.5, 14, nil),
-                            ("\u{1F4A2}", 2, .spiral, 10, 1.5, -0.3, 12, nil),
-                         ])
-        case "SAD":
+case "SAD":
             return .init(bounceAmplitude: -1.5, bounceFrequency: 0.3, rotationAmplitude: 0, rotationFrequency: 0,
                          scaleAmplitude: 0, scaleFrequency: 0,
                          particles: [
@@ -114,6 +99,14 @@ struct MoodAnimationConfig {
                          particles: [
                             ("\u{1F49B}", 2, .float, 4, 3.0, -0.4, 14, nil),
                             ("\u{2615}", 1, .drift, 3, 3.5, -0.3, 12, nil),
+                         ])
+        case "STRESSED":
+            return .init(bounceAmplitude: 1.5, bounceFrequency: 3.0, rotationAmplitude: 0.05, rotationFrequency: 3.5,
+                         scaleAmplitude: 0.02, scaleFrequency: 2.5,
+                         particles: [
+                            ("\u{1F525}", 3, .up, 12, 1.5, -0.5, 14, nil),
+                            ("\u{1F4A8}", 2, .drift, 8, 2.0, -0.4, 12, nil),
+                            ("\u{26A1}", 1, .spiral, 10, 1.8, -0.5, 12, .orange),
                          ])
         default:
             return config(for: "NEUTRAL")
@@ -282,9 +275,13 @@ final class MascotViewModel: ObservableObject {
     @Published private(set) var menuBarIcon: NSImage
     @Published private(set) var sessionUsage: Int? = nil
     @Published private(set) var sessionResetsIn: String? = nil
+    @Published private(set) var isDaemonRunning: Bool = false
 
+    private var sessionResetDate: Date?
     private var originalTemplateImage: NSImage?
     private var timer: Timer?
+    private var countdownTimer: Timer?
+    private var daemonProcess: Process?
     private let cliPath: String
     private let stateWatchQueue = DispatchQueue(label: "app.claude.mascot.statewatch", qos: .utility)
     private var stateFileSource: DispatchSourceFileSystemObject?
@@ -293,6 +290,8 @@ final class MascotViewModel: ObservableObject {
     private var stateDirDescriptor: CInt = -1
     private var contextFileSource: DispatchSourceFileSystemObject?
     private var contextFileDescriptor: CInt = -1
+    private var usageFileSource: DispatchSourceFileSystemObject?
+    private var usageFileDescriptor: CInt = -1
 
     init(cliPath: String = MascotPaths.cliExecutable()) {
         self.cliPath = cliPath
@@ -301,7 +300,7 @@ final class MascotViewModel: ObservableObject {
         self.originalTemplateImage = template
         self.menuBarIcon = template ?? NSImage(systemSymbolName: "hare", accessibilityDescription: nil)!
 
-        readContextRemaining()
+        readUsageData()
         Task { await refresh() }
 
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
@@ -311,15 +310,33 @@ final class MascotViewModel: ObservableObject {
             RunLoop.main.add(timer, forMode: .common)
         }
 
+        // Live countdown timer — ticks every 60s to refresh sessionResetsIn from stored date
+        countdownTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            self?.refreshCountdown()
+        }
+        if let countdownTimer {
+            RunLoop.main.add(countdownTimer, forMode: .common)
+        }
+
         configureStateWatchers()
         startContextFileWatcher()
+        startUsageFileWatcher()
+
+        // Auto-start daemon
+        checkDaemonStatus()
+        if !isDaemonRunning {
+            startDaemon()
+        }
     }
 
     deinit {
         timer?.invalidate()
+        countdownTimer?.invalidate()
+        stopDaemon()
         cancelStateFileWatcher()
         cancelStateDirectoryWatcher()
         cancelContextFileWatcher()
+        cancelUsageFileWatcher()
     }
 
     var menuTitle: String {
@@ -354,48 +371,57 @@ final class MascotViewModel: ObservableObject {
         menuBarIcon = original
     }
 
-    private func readContextRemaining() {
-        let path = MascotPaths.contextFile.path
+    private func readUsageData() {
+        let path = MascotPaths.usageFile.path
         guard FileManager.default.fileExists(atPath: path),
               let data = FileManager.default.contents(atPath: path) else {
             DispatchQueue.main.async {
                 self.sessionUsage = nil
                 self.sessionResetsIn = nil
+                self.sessionResetDate = nil
             }
             return
         }
         do {
             if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let usage = json["usage"] as? [String: Any],
-               let sessionPct = usage["session_pct"] as? Int {
-                let resetsIn = Self.parseResetsCountdown(usage["session_resets"] as? String)
+               let sessionPct = json["session_pct"] as? Int {
+                let resetDate = Self.parseResetDate(json["session_resets"] as? String)
+                let countdown = Self.formatCountdown(from: resetDate)
                 DispatchQueue.main.async {
                     self.sessionUsage = sessionPct
-                    self.sessionResetsIn = resetsIn
+                    self.sessionResetDate = resetDate
+                    self.sessionResetsIn = countdown
                 }
             } else {
                 DispatchQueue.main.async {
                     self.sessionUsage = nil
                     self.sessionResetsIn = nil
+                    self.sessionResetDate = nil
                 }
             }
         } catch {
             DispatchQueue.main.async {
                 self.sessionUsage = nil
                 self.sessionResetsIn = nil
+                self.sessionResetDate = nil
             }
         }
     }
 
-    /// Parse a reset time like "7pm" or "3:30am" into a countdown string like "1h50".
-    /// Returns nil if the string can't be parsed or the reset is not today.
-    private static func parseResetsCountdown(_ raw: String?) -> String? {
+    private func refreshCountdown() {
+        let countdown = Self.formatCountdown(from: sessionResetDate)
+        DispatchQueue.main.async {
+            self.sessionResetsIn = countdown
+        }
+    }
+
+    /// Parse a reset time like "7pm" or "3:30am" into an absolute Date.
+    private static func parseResetDate(_ raw: String?) -> Date? {
         guard let raw, !raw.isEmpty else { return nil }
 
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
 
-        // Try "7pm", "3am", "12pm" etc.
         for fmt in ["ha", "h:mma"] {
             formatter.dateFormat = fmt
             if let time = formatter.date(from: raw.lowercased().trimmingCharacters(in: .whitespaces)) {
@@ -407,22 +433,119 @@ final class MascotViewModel: ObservableObject {
                     second: 0,
                     of: now
                 )!
-                // If reset time already passed today, it means tomorrow
                 if resetDate <= now {
                     resetDate = calendar.date(byAdding: .day, value: 1, to: resetDate)!
                 }
-                let diff = Int(resetDate.timeIntervalSince(now))
-                guard diff > 0 else { return nil }
-                let hours = diff / 3600
-                let minutes = (diff % 3600) / 60
-                if hours > 0 {
-                    return String(format: "%dh%02d", hours, minutes)
-                } else {
-                    return "\(minutes)m"
-                }
+                return resetDate
             }
         }
         return nil
+    }
+
+    /// Format a countdown string like "1h50" from a target Date.
+    static func formatCountdown(from date: Date?) -> String? {
+        guard let date else { return nil }
+        let diff = Int(date.timeIntervalSince(Date()))
+        guard diff > 0 else { return nil }
+        let hours = diff / 3600
+        let minutes = (diff % 3600) / 60
+        if hours > 0 {
+            return String(format: "%dh%02d", hours, minutes)
+        } else {
+            return "\(minutes)m"
+        }
+    }
+
+    // MARK: - Daemon Management
+
+    func startDaemon() {
+        let daemonPath = MascotPaths.daemonExecutable()
+        guard FileManager.default.isExecutableFile(atPath: daemonPath) else { return }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [daemonPath]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+
+        process.terminationHandler = { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.isDaemonRunning = false
+                self?.daemonProcess = nil
+            }
+        }
+
+        do {
+            try process.run()
+            daemonProcess = process
+            DispatchQueue.main.async {
+                self.isDaemonRunning = true
+            }
+        } catch {
+            DispatchQueue.main.async {
+                self.isDaemonRunning = false
+            }
+        }
+    }
+
+    func stopDaemon() {
+        // First try terminating our managed process
+        if let process = daemonProcess, process.isRunning {
+            process.terminate()
+            daemonProcess = nil
+            DispatchQueue.main.async {
+                self.isDaemonRunning = false
+            }
+            return
+        }
+
+        // Fallback: read PID file and send SIGTERM
+        let pidPath = MascotPaths.pidFile.path
+        guard FileManager.default.fileExists(atPath: pidPath),
+              let pidString = try? String(contentsOfFile: pidPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+              let pid = Int32(pidString) else {
+            DispatchQueue.main.async { self.isDaemonRunning = false }
+            return
+        }
+        kill(pid, SIGTERM)
+        try? FileManager.default.removeItem(atPath: pidPath)
+        DispatchQueue.main.async {
+            self.isDaemonRunning = false
+        }
+    }
+
+    func toggleDaemon() {
+        if isDaemonRunning {
+            stopDaemon()
+        } else {
+            startDaemon()
+        }
+    }
+
+    func checkDaemonStatus() {
+        // Check if our managed process is still running
+        if let process = daemonProcess, process.isRunning {
+            DispatchQueue.main.async { self.isDaemonRunning = true }
+            return
+        }
+
+        // Check PID file
+        let pidPath = MascotPaths.pidFile.path
+        guard FileManager.default.fileExists(atPath: pidPath),
+              let pidString = try? String(contentsOfFile: pidPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+              let pid = Int32(pidString) else {
+            DispatchQueue.main.async { self.isDaemonRunning = false }
+            return
+        }
+
+        // kill(pid, 0) checks if process exists without sending a signal
+        let alive = kill(pid, 0) == 0
+        DispatchQueue.main.async {
+            self.isDaemonRunning = alive
+        }
+        if !alive {
+            try? FileManager.default.removeItem(atPath: pidPath)
+        }
     }
 
     private func startContextFileWatcher() {
@@ -445,10 +568,10 @@ final class MascotViewModel: ObservableObject {
                 DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) {
                     self.startContextFileWatcher()
                 }
-                self.readContextRemaining()
+                self.readUsageData()
                 return
             }
-            self.readContextRemaining()
+            self.readUsageData()
         }
         source.setCancelHandler { [weak self] in
             if let fd = self?.contextFileDescriptor, fd >= 0 {
@@ -466,6 +589,50 @@ final class MascotViewModel: ObservableObject {
         if contextFileDescriptor >= 0 {
             close(contextFileDescriptor)
             contextFileDescriptor = -1
+        }
+    }
+
+    private func startUsageFileWatcher() {
+        cancelUsageFileWatcher()
+        let path = MascotPaths.usageFile.path
+        guard FileManager.default.fileExists(atPath: path) else {
+            // File doesn't exist yet — the directory watcher will pick it up
+            return
+        }
+
+        let descriptor = open(path, O_EVTONLY)
+        guard descriptor >= 0 else { return }
+        usageFileDescriptor = descriptor
+
+        let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: descriptor, eventMask: [.write, .delete, .rename], queue: stateWatchQueue)
+        source.setEventHandler { [weak self, weak source] in
+            guard let self else { return }
+            if let events = source?.data, (events.contains(.delete) || events.contains(.rename)) {
+                self.cancelUsageFileWatcher()
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) {
+                    self.startUsageFileWatcher()
+                }
+                self.readUsageData()
+                return
+            }
+            self.readUsageData()
+        }
+        source.setCancelHandler { [weak self] in
+            if let fd = self?.usageFileDescriptor, fd >= 0 {
+                close(fd)
+            }
+            self?.usageFileDescriptor = -1
+        }
+        usageFileSource = source
+        source.resume()
+    }
+
+    private func cancelUsageFileWatcher() {
+        usageFileSource?.cancel()
+        usageFileSource = nil
+        if usageFileDescriptor >= 0 {
+            close(usageFileDescriptor)
+            usageFileDescriptor = -1
         }
     }
 
@@ -548,6 +715,7 @@ final class MascotViewModel: ObservableObject {
         source.setEventHandler { [weak self] in
             self?.startStateFileWatcher()
             self?.startContextFileWatcher()
+            self?.startUsageFileWatcher()
         }
         source.setCancelHandler { [weak self] in
             if let fd = self?.stateDirDescriptor, fd >= 0 {
@@ -596,16 +764,16 @@ struct MascotSnapshot: Decodable {
         let energy: Int
         let serenity: Int
         let rest: Int
-        let appetite: Int
         let bond: Int
+        let vitality: Int?
     }
 
     struct Details: Decodable {
         let serenity: SerenityDetails?
         let rest: RestDetails?
-        let appetite: AppetiteDetails?
         let bond: BondDetails?
         let energy: EnergyDetails?
+        let vitality: VitalityDetails?
     }
 
     struct SerenityDetails: Decodable {
@@ -627,12 +795,6 @@ struct MascotSnapshot: Decodable {
         let interactionDensity: Int?
     }
 
-    struct AppetiteDetails: Decodable {
-        let lastFoodGroup: String?
-        let foodGroupStreak: Int
-        let groupsToday: [String]
-    }
-
     struct BondDetails: Decodable {
         let streakDays: Int
         let todayInteractions: Int
@@ -642,8 +804,13 @@ struct MascotSnapshot: Decodable {
     }
 
     struct EnergyDetails: Decodable {
-        let circadianTarget: Int
-        let circadianPhase: String
+        let usageTarget: Int?
+        let source: String?
+    }
+
+    struct VitalityDetails: Decodable {
+        let systemTarget: Int?
+        let source: String?
     }
 
     struct DayActivity: Decodable {
@@ -714,6 +881,18 @@ struct MascotView: View {
                             .font(.caption2)
                             .foregroundColor(.secondary)
                         Spacer()
+                        Button(action: { viewModel.toggleDaemon() }) {
+                            HStack(spacing: 3) {
+                                Circle()
+                                    .fill(viewModel.isDaemonRunning ? Color.green : Color.red)
+                                    .frame(width: 6, height: 6)
+                                Text("Scraper")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .help(viewModel.isDaemonRunning ? "Scraper running — click to stop" : "Scraper stopped — click to start")
                         Button(action: { showSettings = true }) {
                             Image(systemName: "gear")
                                 .font(.caption)
@@ -788,7 +967,8 @@ private struct StatsSection: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             StatRow(label: "Energy", value: snapshot.stats.energy, color: .yellow,
-                    info: "Follows a circadian rhythm \u{2014} peaks during the day, drops at night.",
+                    info: "Reflects API token usage pace \u{2014} conserving tokens means more energy.",
+                    disabled: snapshot.details?.energy?.source == "fallback",
                     isExpanded: expandedStat == "Energy",
                     onTap: { toggleStat("Energy") }) {
                 if let d = snapshot.details?.energy {
@@ -812,20 +992,21 @@ private struct StatsSection: View {
                     RestDetail(details: d)
                 }
             }
-            StatRow(label: "Appetite", value: snapshot.stats.appetite, color: .orange,
-                    info: "Fed by variety! Different work types are different food groups.",
-                    isExpanded: expandedStat == "Appetite",
-                    onTap: { toggleStat("Appetite") }) {
-                if let d = snapshot.details?.appetite {
-                    AppetiteDetail(details: d)
-                }
-            }
-            StatRow(label: "Bond", value: snapshot.stats.bond, color: .purple,
-                    info: "Grows through consistency \u{2014} daily streaks and long sessions.",
+StatRow(label: "Bond", value: snapshot.stats.bond, color: .purple,
+                    info: "Grows through daily activity \u{2014} +10 per active day, \u{2212}10 per missed day.",
                     isExpanded: expandedStat == "Bond",
                     onTap: { toggleStat("Bond") }) {
                 if let d = snapshot.details?.bond {
                     BondDetail(details: d)
+                }
+            }
+            StatRow(label: "Vitality", value: snapshot.stats.vitality ?? 80, color: .red,
+                    info: "Reflects system health \u{2014} CPU, RAM, disk, and GPU pressure.",
+                    disabled: snapshot.details?.vitality?.source == "fallback",
+                    isExpanded: expandedStat == "Vitality",
+                    onTap: { toggleStat("Vitality") }) {
+                if let d = snapshot.details?.vitality {
+                    VitalityDetail(details: d)
                 }
             }
         }
@@ -1031,50 +1212,6 @@ private struct RestDetail: View {
     }
 }
 
-private struct AppetiteDetail: View {
-    let details: MascotSnapshot.AppetiteDetails
-
-    private struct FoodGroupPill: View {
-        let name: String
-        let icon: String
-        let color: Color
-        let active: Bool
-
-        var body: some View {
-            HStack(spacing: 3) {
-                Image(systemName: icon)
-                    .font(.system(size: 8))
-                Text(name)
-                    .font(.system(size: 9))
-            }
-            .padding(.horizontal, 6)
-            .padding(.vertical, 3)
-            .background(Capsule().fill(active ? color.opacity(0.3) : Color.gray.opacity(0.1)))
-            .foregroundColor(active ? color : .secondary.opacity(0.5))
-        }
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 4) {
-                FoodGroupPill(name: "Protein", icon: "hammer.fill", color: .red,
-                              active: details.groupsToday.contains("protein"))
-                FoodGroupPill(name: "Veg", icon: "leaf.fill", color: .green,
-                              active: details.groupsToday.contains("vegetables"))
-                FoodGroupPill(name: "Carbs", icon: "bubble.left.fill", color: .yellow,
-                              active: details.groupsToday.contains("carbs"))
-                FoodGroupPill(name: "Fiber", icon: "doc.text.fill", color: .brown,
-                              active: details.groupsToday.contains("fiber"))
-            }
-            if let lastGroup = details.lastFoodGroup, details.foodGroupStreak > 1 {
-                Text("Last: \(lastGroup.capitalized) \u{00D7}\(details.foodGroupStreak) (diminishing)")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-            }
-        }
-    }
-}
-
 private struct BondDetail: View {
     let details: MascotSnapshot.BondDetails
 
@@ -1097,25 +1234,41 @@ private struct EnergyDetail: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            DetailRow(icon: "target", text: "Target: \(details.circadianTarget)")
-            let phaseIcon: String = {
-                switch details.circadianPhase {
-                case "rising": return "sunrise"
-                case "plateau": return "sun.max"
-                case "winding_down": return "sunset"
-                default: return "moon"
+            if let target = details.usageTarget {
+                DetailRow(icon: "target", text: "Target: \(target)")
+            }
+            let sourceLabel: String = {
+                switch details.source {
+                case "usage": return "Based on API token usage pace"
+                case "fallback": return "Usage data unavailable"
+                default: return "Unknown source"
                 }
             }()
-            let phaseLabel: String = {
-                switch details.circadianPhase {
-                case "rising": return "Rising (6am\u{2013}10am)"
-                case "plateau": return "Plateau (10am\u{2013}6pm)"
-                case "winding_down": return "Winding down (6pm\u{2013}10pm)"
-                case "sleeping": return "Sleep time (10pm\u{2013}6am)"
-                default: return details.circadianPhase.capitalized
+            let sourceIcon: String = details.source == "usage" ? "bolt.fill" : "questionmark.circle"
+            DetailRow(icon: sourceIcon, text: sourceLabel,
+                      color: details.source == "usage" ? .green : .secondary)
+        }
+    }
+}
+
+private struct VitalityDetail: View {
+    let details: MascotSnapshot.VitalityDetails
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            if let target = details.systemTarget {
+                DetailRow(icon: "target", text: "Target: \(target)")
+            }
+            let sourceLabel: String = {
+                switch details.source {
+                case "system": return "Based on system metrics"
+                case "fallback": return "System data unavailable"
+                default: return "Unknown source"
                 }
             }()
-            DetailRow(icon: phaseIcon, text: phaseLabel)
+            let sourceIcon: String = details.source == "system" ? "cpu" : "questionmark.circle"
+            DetailRow(icon: sourceIcon, text: sourceLabel,
+                      color: details.source == "system" ? .green : .secondary)
         }
     }
 }
@@ -1233,11 +1386,7 @@ struct MoodPalette {
             return MoodPalette(accent: Color(hex: 0x64748b), icon: "bed.double.fill")
         case "SLEEPING":
             return MoodPalette(accent: Color(hex: 0x475569), icon: "powersleep")
-        case "HUNGRY":
-            return MoodPalette(accent: Color(hex: 0xfb923c), icon: "fork.knife")
-        case "STARVING":
-            return MoodPalette(accent: Color(hex: 0xef4444), icon: "flame.fill")
-        case "SAD":
+case "SAD":
             return MoodPalette(accent: Color(hex: 0x818cf8), icon: "cloud.rain")
         case "LONELY":
             return MoodPalette(accent: Color(hex: 0xa78bfa), icon: "person.fill.badge.minus")
@@ -1245,6 +1394,8 @@ struct MoodPalette {
             return MoodPalette(accent: Color(hex: 0xfbbf24), icon: "exclamationmark.triangle")
         case "CONCERNED":
             return MoodPalette(accent: Color(hex: 0x38bdf8), icon: "heart.circle")
+        case "STRESSED":
+            return MoodPalette(accent: Color(hex: 0xf97316), icon: "flame")
         default:
             return MoodPalette(accent: Color(hex: 0xffffff), icon: "face.smiling")
         }
@@ -1319,6 +1470,45 @@ struct MascotPaths {
     static var contextFile: URL {
         stateDirectory.appendingPathComponent("context.json", isDirectory: false)
     }
+
+    static var usageFile: URL {
+        stateDirectory.appendingPathComponent("usage.json", isDirectory: false)
+    }
+
+    static var pidFile: URL {
+        stateDirectory.appendingPathComponent(".usage-daemon.pid", isDirectory: false)
+    }
+
+    static func repoRoot() -> URL {
+        // 1. Env override
+        if let override = ProcessInfo.processInfo.environment["TAMAGOTCHI_REPO_ROOT"] {
+            return URL(fileURLWithPath: override)
+        }
+
+        // 2. Resolve from running binary location
+        if let execURL = Bundle.main.executableURL {
+            let root = execURL
+                .deletingLastPathComponent() // MacOS/
+                .deletingLastPathComponent() // Contents/
+                .deletingLastPathComponent() // TamaclaudechiMenuBar.app/
+                .deletingLastPathComponent() // build/
+                .deletingLastPathComponent() // menubar/
+                .deletingLastPathComponent() // → repo root
+            if FileManager.default.fileExists(atPath: root.appendingPathComponent("scripts").path) {
+                return root
+            }
+        }
+
+        // 3. Compile-time fallback
+        return URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // TamaclaudechiMenuBar/
+            .deletingLastPathComponent() // Sources/
+            .deletingLastPathComponent() // menubar/
+    }
+
+    static func daemonExecutable() -> String {
+        repoRoot().appendingPathComponent("scripts/usage-daemon").path
+    }
 }
 
 // MARK: - Config Manager
@@ -1347,17 +1537,20 @@ struct RepoRootInfo: Identifiable {
 
 final class ConfigManager: ObservableObject {
     @Published var repoRoots: [RepoRootInfo] = []
+    @Published var telegramBotToken: String = ""
+    @Published var telegramChatId: String = ""
+    @Published var telegramEnabled: Bool = true
+    @Published var telegramTestResult: String?
 
-    private let cliPath: String
     private let configWatchQueue = DispatchQueue(label: "app.claude.mascot.configwatch", qos: .utility)
     private var configFileSource: DispatchSourceFileSystemObject?
     private var configDirSource: DispatchSourceFileSystemObject?
     private var configFileDescriptor: CInt = -1
     private var configDirDescriptor: CInt = -1
 
-    init(cliPath: String = MascotPaths.cliExecutable()) {
-        self.cliPath = cliPath
+    init() {
         loadConfig()
+        loadEnv()
         configureConfigWatchers()
     }
 
@@ -1367,68 +1560,136 @@ final class ConfigManager: ObservableObject {
     }
 
     func loadConfig() {
-        Task {
-            do {
-                let data = try await runCLI(arguments: ["config", "repo-roots", "--scan"])
-                let decoder = JSONDecoder()
-                struct ScanResult: Decodable {
-                    let path: String
-                    let hasClaudeDir: Bool
-                    let isGitRepo: Bool
+        let path = MascotPaths.configFile.path
+        guard FileManager.default.fileExists(atPath: path),
+              let data = FileManager.default.contents(atPath: path) else {
+            DispatchQueue.main.async { self.repoRoots = [] }
+            return
+        }
+        do {
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let paths = json["repoRoots"] as? [String] {
+                let fm = FileManager.default
+                let roots = paths.map { p in
+                    RepoRootInfo(
+                        path: p,
+                        hasClaudeDir: fm.fileExists(atPath: p + "/.claude"),
+                        isGitRepo: fm.fileExists(atPath: p + "/.git")
+                    )
                 }
-                let results = try decoder.decode([ScanResult].self, from: data)
-                let roots = results.map { RepoRootInfo(path: $0.path, hasClaudeDir: $0.hasClaudeDir, isGitRepo: $0.isGitRepo) }
-                await MainActor.run { self.repoRoots = roots }
-            } catch {
-                // Silently fail — config may not exist yet
+                DispatchQueue.main.async { self.repoRoots = roots }
             }
+        } catch {
+            DispatchQueue.main.async { self.repoRoots = [] }
         }
     }
 
     func addRepoRoot(path: String) {
-        Task {
-            do {
-                _ = try await runCLI(arguments: ["config", "repo-roots", "--add", path])
-                loadConfig()
-            } catch {
-                // Silently fail
-            }
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: path) else { return }
+        let resolved = URL(fileURLWithPath: path).standardized.path
+
+        let configPath = MascotPaths.configFile.path
+        var config: [String: Any] = [:]
+        if let data = fm.contents(atPath: configPath),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            config = json
         }
+        var roots = config["repoRoots"] as? [String] ?? []
+        guard !roots.contains(resolved) else { return }
+        roots.append(resolved)
+        config["repoRoots"] = roots
+        if config["version"] == nil { config["version"] = 1 }
+
+        if let data = try? JSONSerialization.data(withJSONObject: config) {
+            try? data.write(to: MascotPaths.configFile)
+        }
+        loadConfig()
     }
 
     func removeRepoRoot(path: String) {
-        Task {
-            do {
-                _ = try await runCLI(arguments: ["config", "repo-roots", "--remove", path])
-                loadConfig()
-            } catch {
-                // Silently fail
+        let configPath = MascotPaths.configFile.path
+        let fm = FileManager.default
+        guard let data = fm.contents(atPath: configPath),
+              var config = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              var roots = config["repoRoots"] as? [String] else { return }
+        roots.removeAll { $0 == path }
+        config["repoRoots"] = roots
+        if let newData = try? JSONSerialization.data(withJSONObject: config) {
+            try? newData.write(to: MascotPaths.configFile)
+        }
+        loadConfig()
+    }
+
+    // MARK: - Telegram .env management
+
+    func loadEnv() {
+        let envPath = MascotPaths.repoRoot().appendingPathComponent(".env").path
+        guard FileManager.default.fileExists(atPath: envPath),
+              let contents = try? String(contentsOfFile: envPath, encoding: .utf8) else {
+            return
+        }
+        for line in contents.split(separator: "\n", omittingEmptySubsequences: false) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("#") || trimmed.isEmpty { continue }
+            let parts = trimmed.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            let key = parts[0].trimmingCharacters(in: .whitespaces)
+            var value = parts[1].trimmingCharacters(in: .whitespaces)
+            // Strip surrounding quotes
+            if (value.hasPrefix("\"") && value.hasSuffix("\"")) || (value.hasPrefix("'") && value.hasSuffix("'")) {
+                value = String(value.dropFirst().dropLast())
+            }
+            switch key {
+            case "TELEGRAM_BOT_TOKEN": telegramBotToken = value
+            case "TELEGRAM_CHAT_ID": telegramChatId = value
+            case "TELEGRAM_ENABLED": telegramEnabled = (value == "true")
+            default: break
             }
         }
     }
 
-    private func runCLI(arguments: [String]) async throws -> Data {
-        return try await Task.detached(priority: .background) {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: self.cliPath)
-            process.arguments = arguments
+    func saveEnv() {
+        let envPath = MascotPaths.repoRoot().appendingPathComponent(".env").path
+        let content = """
+        TELEGRAM_BOT_TOKEN="\(telegramBotToken)"
+        TELEGRAM_CHAT_ID="\(telegramChatId)"
+        TELEGRAM_ENABLED="\(telegramEnabled ? "true" : "false")"
+        """
+        try? content.write(toFile: envPath, atomically: true, encoding: .utf8)
+    }
 
-            let output = Pipe()
-            let errorPipe = Pipe()
-            process.standardOutput = output
-            process.standardError = errorPipe
+    func testTelegram() {
+        guard !telegramBotToken.isEmpty, !telegramChatId.isEmpty else {
+            telegramTestResult = "Token and Chat ID required"
+            return
+        }
+        telegramTestResult = "Sending..."
+        let urlString = "https://api.telegram.org/bot\(telegramBotToken)/sendMessage"
+        guard let url = URL(string: urlString) else {
+            telegramTestResult = "Invalid bot token format"
+            return
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        let body = "chat_id=\(telegramChatId)&text=✅ Test from TamaclaudechiMenuBar"
+        request.httpBody = body.data(using: .utf8)
 
-            try process.run()
-            process.waitUntilExit()
-
-            if process.terminationStatus != 0 {
-                let errData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-                let message = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-                throw MascotError.commandFailed(message ?? "Command failed with code \(process.terminationStatus)")
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                if let error {
+                    self?.telegramTestResult = "Error: \(error.localizedDescription)"
+                    return
+                }
+                if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
+                    self?.telegramTestResult = "Sent!"
+                } else {
+                    let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                    self?.telegramTestResult = "Failed (HTTP \(status))"
+                }
             }
-
-            return output.fileHandleForReading.readDataToEndOfFile()
-        }.value
+        }.resume()
     }
 
     // MARK: Config file watchers
@@ -1569,6 +1830,64 @@ struct SettingsView: View {
                 }
                 Spacer()
             }
+
+            Divider()
+                .padding(.vertical, 4)
+
+            // MARK: - Telegram Notifications
+            Text("Telegram Notifications")
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+
+            Toggle("Enable notifications", isOn: $configManager.telegramEnabled)
+                .font(.footnote)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Bot Token")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                SecureField("Paste bot token from @BotFather", text: $configManager.telegramBotToken)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.footnote)
+
+                Text("Chat ID")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                TextField("Numeric chat ID", text: $configManager.telegramChatId)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.footnote)
+            }
+
+            HStack {
+                Button("Save") {
+                    configManager.saveEnv()
+                }
+                Button("Test") {
+                    configManager.saveEnv()
+                    configManager.testTelegram()
+                }
+                if let result = configManager.telegramTestResult {
+                    Text(result)
+                        .font(.caption2)
+                        .foregroundColor(result == "Sent!" ? .green : .secondary)
+                }
+                Spacer()
+            }
+
+            DisclosureGroup("Setup instructions") {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("1. Open Telegram, find @BotFather")
+                    Text("2. Send /newbot, copy the token")
+                    Text("3. Start a chat with your bot")
+                    Text("4. Get your chat ID:")
+                    Text("   curl \"https://api.telegram.org/bot<TOKEN>/getUpdates\"")
+                        .font(.system(.caption2, design: .monospaced))
+                    Text("5. Paste token + chat ID above, Save & Test")
+                }
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            }
+            .font(.footnote)
         }
     }
 

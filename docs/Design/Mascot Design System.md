@@ -1,19 +1,20 @@
 ---
 created: 2026-03-13
-updated: 2026-03-13
+updated: 2026-03-20
+description: "Stat definitions, mood cascade, visual specs, achievements, and temporal modifiers"
 ---
 # Mascot Design Reference
 
-## Stats (v2, 0–100 scale)
+## Stats (v4, 0–100 scale)
 
-Each stat measures a genuinely different dimension — no two stats grow from the same behavior.
+Each stat measures a genuinely different dimension — no two stats grow from the same behavior. The [[Instructions/Tamagotchi CLI]] implements all stat mutations and decay.
 
 ### Stat Overview
 - **Energy**: Circadian curve tied to time of day. Unchanged from v1.
 - **Serenity**: Repo tidiness — inspects git state on every update. −1/hr decay.
 - **Rest**: Healthy work patterns — rewards breaks, penalizes overwork. +2/hr passive recovery (caps at 80).
-- **Appetite**: Work variety — food group system with diminishing returns. −4/hr decay (fastest).
 - **Bond**: Relationship consistency — streaks, depth, returning. −0.5/hr decay (slowest).
+- **Vitality**: System health — maps from CPU/RAM/disk/swap/GPU metrics. Converges toward system-derived target.
 
 ### Energy Circadian Curve
 | Time | Range | Behavior |
@@ -46,16 +47,6 @@ Each stat measures a genuinely different dimension — no two stats grow from th
 | Working past midnight | −5/hr (stacks) |
 | Session >4 hours | −8 |
 
-### Appetite — Food Groups
-| Food group | Triggers |
-|---|---|
-| Protein | `code_change`, `task_complete` |
-| Vegetables | `test_run`, `lint_run` |
-| Carbs | `prompt`, `permission`, `feed` |
-| Fiber | `docs_change`, `refactor` |
-
-First meal: +20. Same group: +15 → +10 → +5 → +2. Switching groups resets counters.
-
 ### Bond — Consistency Signals
 | Signal | Effect |
 |--------|--------|
@@ -68,7 +59,7 @@ First meal: +20. Same group: +15 → +10 → +5 → +2. Switching groups resets 
 | Pet interaction | +5 |
 
 ### Derived
-- **Wellbeing** = `energy×0.20 + serenity×0.20 + rest×0.15 + appetite×0.25 + bond×0.20`
+- **Wellbeing** = `energy×0.20 + serenity×0.20 + rest×0.15 + bond×0.30 + vitality×0.15` (weights adjust when energy/vitality sources unavailable)
 - **Streak**: Consecutive days with 3+ interactions
 - **Lifetime interactions**: Total prompts witnessed (never resets)
 
@@ -80,15 +71,14 @@ First meal: +20. Same group: +15 → +10 → +5 → +2. Switching groups resets 
 | 2 | energy < 30 AND hour > 22 | SLEEPY |
 | 3 | serenity < 25 | ANXIOUS |
 | 4 | rest < 25 | CONCERNED |
-| 5 | appetite < 15 | STARVING |
-| 6 | bond < 20 | LONELY |
+| 5 | bond < 20 | LONELY |
+| 6 | vitality < 25 | STRESSED |
 | 7 | rest < 30 | SAD |
-| 8 | appetite < 30 | HUNGRY |
-| 9 | appetite > 80 AND energy > 60 | EXCITED |
-| 10 | wellbeing > 80 AND streak > 3 | ECSTATIC |
-| 11 | wellbeing > 65 | HAPPY |
-| 12 | energy < 45 | TIRED |
-| 13 | else | NEUTRAL |
+| 8 | bond > 80 AND energy > 60 | EXCITED |
+| 9 | wellbeing > 80 AND streak > 3 | ECSTATIC |
+| 10 | wellbeing > 65 | HAPPY |
+| 11 | energy < 45 | TIRED |
+| 12 | else | NEUTRAL |
 
 ## Mood Visuals
 
@@ -101,8 +91,6 @@ First meal: +20. Same group: +15 → +10 → +5 → +2. Switching groups resets 
 | TIRED | Slow (600ms), 3deg tilt | `brightness(0.85)` | `#94a3b8` | Occasional yawn bob |
 | SLEEPY | Very slow (800ms), 8deg tilt | `brightness(0.7) saturate(0.5)` | `#64748b` | ZZZ floating up |
 | SLEEPING | Still (1000ms), 12deg tilt | `brightness(0.5) saturate(0.3)` | `#475569` | ZZZ only, no speech |
-| HUNGRY | Normal + rumble interrupts | — | `#fb923c` | Stomach wobble |
-| STARVING | Jittery (200ms) | `hue-rotate(-20deg) saturate(1.5)` | `#ef4444` | Orbiting "!" marks |
 | SAD | Slow sway (550ms), 2deg tilt | `saturate(0.6) brightness(0.9)` | `#818cf8` | Rain drops |
 | LONELY | Very slow (700ms), 3deg tilt | `saturate(0.4) brightness(0.8)` | `#a78bfa` | Tear drop |
 | ANXIOUS | Jittery shake (250ms) | — | `#fbbf24` | Warning signs + save icon |
@@ -115,8 +103,7 @@ Injected into codex prompt to shape the quip's tone:
 - **EXCITED**: "Buzzing with excitement, everything is fascinating!"
 - **ANXIOUS**: "Visibly nervous about the messy repo, suggesting we commit..."
 - **CONCERNED**: "Worried about the user's wellbeing, gently suggesting a break"
-- **HUNGRY**: "Hungry, hinting about wanting a different kind of work to chew on"
-- **STARVING**: "HANGRY, dramatically demanding some variety in the work diet!"
+- **STRESSED**: "Stressed about system resources, keeps mentioning how hot things are running, a bit frazzled"
 - **SLEEPY**: "Barely awake, mumbling and yawning, words trailing off..."
 - **LONELY**: "Lonely, missed the user SO much, clingy and affectionate"
 - **SAD**: "A bit down, speak softly and with slight melancholy"
@@ -134,8 +121,6 @@ Injected into codex prompt to shape the quip's tone:
 
 ## Temporal Modifiers
 
-- **Friday after 16:00**: +15 appetite
-- **Monday before 10:00**: -10 appetite
 - **Witching hour (03–05)**: Purple tint, ghost particles (future)
 - **Anniversary of firstMet**: Rainbow override (future)
 
@@ -148,3 +133,11 @@ Use an eye tracker so the mascot appears where the user is actually looking on s
 - All stats at 100 → "Nirvana" mode: golden aura, speaks in haiku
 - All stats below 20 → "Ghost" mode: translucent, whispers
 - User prompt contains "love" → +20 bond, heart explosion
+
+---
+
+## See Also
+
+- [[Architecture/System Overview]] — how stats flow through the event pipeline
+- [[Instructions/Tamagotchi CLI]] — CLI implementation of decay and events
+- [[Instructions/Toast Overlay]] — mood visual implementation (CSS, particles)

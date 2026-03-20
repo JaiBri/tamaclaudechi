@@ -1,10 +1,11 @@
 ---
 created: 2026-03-15
-updated: 2026-03-17
+updated: 2026-03-20
+description: "Claude Code context monitor — usage tracking, git status, and terminal display"
 ---
 # Status Line (Context Monitor)
 
-The status line script bridges Claude Code's context window metrics into the Tamaclaudchi system, powering the "Brain" bar in the menu bar companion.
+The status line script bridges Claude Code's context window metrics into the Tamaclaudechi system, powering the "Brain" bar in the [[Instructions/Menu Bar Companion]].
 
 ## How It Works
 
@@ -158,3 +159,11 @@ cat ~/.config/claude-mascot/context.json
 # Kill probe session for cleanup
 tmux kill-session -t claude-usage
 ```
+
+---
+
+## See Also
+
+- [[Architecture/System Overview]] — where the status line fits in the pipeline
+- [[Instructions/Menu Bar Companion]] — consumes context.json for Brain bar
+- [[Reference/Key Files]] — script and config file locations

@@ -1,6 +1,7 @@
 ---
 created: 2026-03-13
-updated: 2026-03-13
+updated: 2026-03-20
+description: "Master index of all vault documentation"
 ---
 # Tamaclaudechi Vault Index
 
