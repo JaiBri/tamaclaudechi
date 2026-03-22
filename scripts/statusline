@@ -23,13 +23,16 @@ remaining=$(echo "$INPUT" | perl -ne 'print $1 if /"remaining_percentage"\s*:\s*
 used=$(echo "$INPUT" | perl -ne 'print $1 if /"used_percentage"\s*:\s*(-?[0-9.]+)/' || echo "")
 session_id=$(echo "$INPUT" | perl -ne 'print $1 if /"session_id"\s*:\s*"([^"]*)"/' || echo "")
 
-# If we couldn't extract context data, pass through silently
-if [ -z "$remaining" ] && [ -z "$used" ]; then
+# If we couldn't extract any context data at all (no context_window in input), pass through silently.
+# Note: remaining/used being empty just means null JSON values (start of session) — that is valid.
+if [ -z "$remaining" ] && [ -z "$used" ] && ! echo "$INPUT" | grep -q '"context_window"'; then
   exit 0
 fi
 
 # Default missing values
-remaining=${remaining:-0}
+# remaining_percentage is null before the first assistant message — default to 100 (full context)
+# used_percentage is null before the first assistant message — default to 0
+remaining=${remaining:-100}
 used=${used:-0}
 
 # Round to integers (perl may give floats)
