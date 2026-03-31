@@ -100,6 +100,23 @@ git_section() {
   local stash=0
   stash=$(git stash list 2>/dev/null | wc -l | tr -d ' ')
 
+  # -- Worktree info --
+  local wt_count=0 wt_name=""
+  local wt_output
+  wt_output=$(git worktree list 2>/dev/null) || true
+  if [ -n "$wt_output" ]; then
+    wt_count=$(echo "$wt_output" | wc -l | tr -d ' ')
+  fi
+  local wt_main_path wt_current_path
+  wt_main_path=$(echo "$wt_output" | head -1 | awk '{print $1}')
+  wt_current_path=$(git rev-parse --show-toplevel 2>/dev/null)
+  if [ "$wt_current_path" = "$wt_main_path" ]; then
+    wt_name="main"
+  else
+    wt_name=$(basename "$wt_current_path")
+  fi
+  [ "${#wt_name}" -gt 15 ] && wt_name="${wt_name:0:15}..."
+
   # -- Branch counts (cached 30s) --
   local branches=0 unmerged=0
   local repo_hash
@@ -141,6 +158,9 @@ git_section() {
   else
     out="${out}${branch}"
   fi
+
+  # Worktree indicator
+  out="${out}  ${DIM}🌳 ${wt_count}wt·${wt_name}${RESET}"
 
   # Operation state
   if [ -n "$operation" ]; then
@@ -196,6 +216,8 @@ git_section() {
   _git_branches="$branches"
   _git_unmerged="$unmerged"
   _git_operation="$operation"
+  _git_worktree_count="$wt_count"
+  _git_worktree_name="$wt_name"
 
   git="$out"
 }

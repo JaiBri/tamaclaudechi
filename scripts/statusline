@@ -89,7 +89,7 @@ source "${SCRIPT_DIR}/statusline-sections/session-files.sh"
 git=""
 _git_branch="" _git_ahead=0 _git_behind=0 _git_staged=0 _git_unstaged=0
 _git_untracked=0 _git_conflicts=0 _git_stash=0 _git_diff_add=0 _git_diff_del=0
-_git_branches=0 _git_unmerged=0 _git_operation=""
+_git_branches=0 _git_unmerged=0 _git_operation="" _git_worktree_count=0 _git_worktree_name=""
 git_section
 
 # Run usage section
@@ -132,7 +132,9 @@ cat > "$tmp_file" <<ENDJSON
     "diff_del": ${_git_diff_del},
     "branches": ${_git_branches},
     "unmerged": ${_git_unmerged},
-    "operation": "${_git_operation}"
+    "operation": "${_git_operation}",
+    "worktree_count": ${_git_worktree_count},
+    "worktree_name": $([ -n "$_git_worktree_name" ] && echo "\"$_git_worktree_name\"" || echo null)
   },
   "usage": {
     "session_pct": ${_usage_session_pct:-null},
@@ -206,38 +208,33 @@ else
   brain="🧠 ${remaining}%"
 fi
 
-# Terminal width for wrapping
-term_width=$(tput cols 2>/dev/null || echo 80)
-
-# Measure visible width (strip ANSI escapes + OSC hyperlinks)
-visible_len() {
-  printf '%s' "$1" | perl -pe 's/\e\]8;[^\e]*\e\\//g; s/\e\[[0-9;]*m//g' | wc -m | tr -d ' '
+# ── Topic-based output (max 3 lines) ────────────────────────
+join_and_emit() {
+  local line="" s=""
+  for part in "$@"; do
+    line="${line}${s}${part}"
+    s="  │  "
+  done
+  [ -n "$line" ] && echo "$line"
 }
 
-# Collect sections into array
-parts=("${brain}")
-[ -n "$usage" ] && parts+=("${usage}")
-parts+=("${vite}")
-parts+=("${cf}")
-[ -n "$system" ] && parts+=("${system}")
-[ -n "$git" ] && parts+=("${git}")
+# Line 1: context & services
+line1_parts=("${brain}")
+[ -n "$usage" ] && line1_parts+=("${usage}")
+line1_parts+=("${vite}" "${cf}")
 
-# Build lines, wrapping at section boundaries when overflow
-line=""
-sep=""
-for part in "${parts[@]}"; do
-  candidate="${line}${sep}${part}"
-  if [ -n "$line" ] && [ "$(visible_len "$candidate")" -gt "$term_width" ]; then
-    echo "$line"
-    line="${part}"
-  else
-    line="$candidate"
-  fi
-  sep="  │  "
-done
-[ -n "$line" ] && echo "$line"
+# Line 2: code state
+line2_parts=()
+[ -n "$git" ] && line2_parts+=("${git}")
+[ -n "$session_files" ] && line2_parts+=("${session_files}")
 
-[ -n "$session_files" ] && echo "$session_files"
+# Line 3: health (only when alerts fire)
+line3_parts=()
+[ -n "$system" ] && line3_parts+=("${system}")
+
+join_and_emit "${line1_parts[@]}"
+[ "${#line2_parts[@]}" -gt 0 ] && join_and_emit "${line2_parts[@]}"
+[ "${#line3_parts[@]}" -gt 0 ] && join_and_emit "${line3_parts[@]}"
 
 # ── Background usage scraper trigger ─────────────────────────
 # Spawn scraper if cache is stale (>5 min) or missing
