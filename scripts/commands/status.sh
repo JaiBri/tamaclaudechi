@@ -19,9 +19,10 @@ cmd_status() {
   # Apply decay for display (don't write)
   local decayed
   decayed=$(apply_decay)
-  read -r en se re bo vi ea va <<< "$decayed"
+  read -r en se re bo vi ea va sa <<< "$decayed"
 
   # Apply serenity convergence from git state for display (inline to preserve _d_* detail vars)
+  if [ "$sa" -eq 1 ]; then
   local _serenity_result
   _serenity_result=$(compute_serenity_from_git)
   local _serenity_adj
@@ -38,6 +39,9 @@ cmd_status() {
     [ "$distance" -eq 0 ] && step=0
     se=$(clamp $((se + step)))
   fi
+  else
+    _d_in_git_repo=false
+  fi
 
   # Compute rest details for display (no drain applied — status is read-only)
   local rest_result
@@ -46,18 +50,18 @@ cmd_status() {
   read -r rest_adj _d_session_minutes _d_late_night_penalty _d_is_marathon _d_interaction_density <<< "$rest_result"
 
   local temped
-  temped=$(temporal_modifier "$en" "$se" "$re" "$bo" "$vi" "$ea" "$va")
-  read -r en se re bo vi ea va <<< "$temped"
+  temped=$(temporal_modifier "$en" "$se" "$re" "$bo" "$vi" "$ea" "$va" "$sa")
+  read -r en se re bo vi ea va sa <<< "$temped"
 
   local mood wb name streak lifetime
-  mood=$(resolve_mood "$en" "$se" "$re" "$bo" "$vi" "$ea" "$va")
-  wb=$(wellbeing "$en" "$se" "$re" "$bo" "$vi" "$ea" "$va")
+  mood=$(resolve_mood "$en" "$se" "$re" "$bo" "$vi" "$ea" "$va" "$sa")
+  wb=$(wellbeing "$en" "$se" "$re" "$bo" "$vi" "$ea" "$va" "$sa")
   name=$(json_val name)
   streak=$(json_val streak)
   lifetime=$(json_val lifetimeInteractions)
 
   if [ "$mode" = "json" ]; then
-    output_json "$en" "$se" "$re" "$bo" "$vi" "$ea" "$va" "$mood"
+    output_json "$en" "$se" "$re" "$bo" "$vi" "$ea" "$va" "$sa" "$mood"
     return
   fi
 
@@ -79,10 +83,12 @@ cmd_status() {
   else
     printf "│  Energy:    %-16s│\n" "—"
   fi
-  printf "│  Serenity:  %-5s" "$se"
-  local bar=""; local i=0
-  while [ $i -lt $((se / 10)) ]; do bar="${bar}█"; i=$((i + 1)); done
-  printf "%-11s│\n" "$bar"
+  if [ "$sa" -eq 1 ]; then
+    printf "│  Serenity:  %-5s" "$se"
+    local bar=""; local i=0
+    while [ $i -lt $((se / 10)) ]; do bar="${bar}█"; i=$((i + 1)); done
+    printf "%-11s│\n" "$bar"
+  fi
   printf "│  Rest:      %-5s" "$re"
   bar=""; i=0
   while [ $i -lt $((re / 10)) ]; do bar="${bar}█"; i=$((i + 1)); done

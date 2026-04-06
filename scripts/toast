@@ -8,11 +8,13 @@
 MODE="done"
 MOOD="NEUTRAL"
 ACHIEVEMENT=""
+VOLUME="0.15"
 while [ $# -gt 0 ]; do
   case "$1" in
     --mode) MODE="$2"; shift 2 ;;
     --mood) MOOD="$2"; shift 2 ;;
     --achievement) ACHIEVEMENT="$2"; shift 2 ;;
+    --volume) VOLUME="$2"; shift 2 ;;
     *) break ;;
   esac
 done
@@ -130,7 +132,7 @@ chmod +x "$ACTIVATE_SCRIPT"
     FILES=($(ls -1 "$QUEUE_DIR" 2>/dev/null | sort))
 
     # Build batch JSON with voice file paths (JS plays audio directly)
-    BATCH_JSON='{"messages":['
+    BATCH_JSON='{"volume":'$VOLUME',"messages":['
     TOTAL_MS=0
     FIRST=1
     LAST_VOICE=""

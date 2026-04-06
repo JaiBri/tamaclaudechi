@@ -343,11 +343,13 @@ SAD:       { speed: 550, amplitude: 0.12, bob: 3, sway: 2, tilt: 2, filter: 'sat
     return sum / (freqData.length * 255); // 0-1
   }
 
+  let globalVolume = 0.15;
+
   // Play a single audio file, routed through analyser
   function playAudioFile(path) {
     return new Promise(resolve => {
       const audio = new Audio('file://' + path);
-      audio.volume = 0.15;
+      audio.volume = globalVolume;
       if (audioCtx) {
         try {
           const src = audioCtx.createMediaElementSource(audio);
@@ -942,7 +944,10 @@ SAD:       { speed: 550, amplitude: 0.12, bob: 3, sway: 2, tilt: 2, filter: 'sat
   // --- Load batch and run ---
   fetch('file:///tmp/toast-batch.json')
     .then(r => r.json())
-    .then(data => runBatch(data.messages))
+    .then(data => {
+      if (typeof data.volume === 'number') globalVolume = data.volume;
+      runBatch(data.messages);
+    })
     .catch(() => {
       // Fallback: single default message
       runBatch([{ msg: 'Hello', mode: 'done', duration: 3000, voiceDur: 3000 }]);

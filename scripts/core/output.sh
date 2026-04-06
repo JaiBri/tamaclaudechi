@@ -3,10 +3,10 @@
 # --- Output JSON for hook consumption ---
 # Detail variables are set by callers (cmd_update/cmd_status) before calling this
 output_json() {
-  local en=$1 se=$2 re=$3 bo=$4 vi=$5 ea=${6:-1} va=${7:-1} mood=${8} achievement="${9:-}"
+  local en=$1 se=$2 re=$3 bo=$4 vi=$5 ea=${6:-1} va=${7:-1} sa=${8:-1} mood=${9} achievement="${10:-}"
   local personality wb name streak lifetime
   personality=$(mood_personality "$mood")
-  wb=$(wellbeing "$en" "$se" "$re" "$bo" "$vi" "$ea" "$va")
+  wb=$(wellbeing "$en" "$se" "$re" "$bo" "$vi" "$ea" "$va" "$sa")
   name=$(json_val name)
   streak=$(json_val streak)
   lifetime=$(json_val lifetimeInteractions)

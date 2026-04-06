@@ -148,9 +148,11 @@ apply_decay() {
   fi
 
   # Availability flags: 1 if data source exists, 0 if fallback
-  local en_active=1 vi_active=1
+  local en_active=1 vi_active=1 se_active=1
   [ "$target" -eq -1 ] && en_active=0
   [ "$vi_target" -eq -1 ] && vi_active=0
+  local git_cfg; git_cfg=$(config_val gitStateEnabled)
+  [ "$git_cfg" = "false" ] && se_active=0
 
-  echo "$energy $serenity $rest $bond $vitality $en_active $vi_active"
+  echo "$energy $serenity $rest $bond $vitality $en_active $vi_active $se_active"
 }

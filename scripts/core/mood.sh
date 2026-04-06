@@ -3,10 +3,10 @@
 # --- Compute wellbeing ---
 # ea/va: 1=active, 0=inactive (excluded from calculation)
 wellbeing() {
-  local en=$1 se=$2 re=$3 bo=$4 vi=$5 ea=${6:-1} va=${7:-1}
+  local en=$1 se=$2 re=$3 bo=$4 vi=$5 ea=${6:-1} va=${7:-1} sa=${8:-1}
   local sum=0 total=0
   if [ "$ea" -eq 1 ]; then sum=$((sum + en * 20)); total=$((total + 20)); fi
-  sum=$((sum + se * 20)); total=$((total + 20))
+  if [ "$sa" -eq 1 ]; then sum=$((sum + se * 20)); total=$((total + 20)); fi
   sum=$((sum + re * 15)); total=$((total + 15))
   sum=$((sum + bo * 30)); total=$((total + 30))
   if [ "$va" -eq 1 ]; then sum=$((sum + vi * 15)); total=$((total + 15)); fi
@@ -16,9 +16,9 @@ wellbeing() {
 # --- Resolve mood (first-match priority) ---
 # ea/va: 1=active, 0=inactive (skip mood checks for inactive stats)
 resolve_mood() {
-  local en=$1 se=$2 re=$3 bo=$4 vi=$5 ea=${6:-1} va=${7:-1}
+  local en=$1 se=$2 re=$3 bo=$4 vi=$5 ea=${6:-1} va=${7:-1} sa=${8:-1}
   local wb streak hour
-  wb=$(wellbeing "$en" "$se" "$re" "$bo" "$vi" "$ea" "$va")
+  wb=$(wellbeing "$en" "$se" "$re" "$bo" "$vi" "$ea" "$va" "$sa")
   streak=$(json_val streak)
   hour=$(current_hour)
 
@@ -27,7 +27,8 @@ resolve_mood() {
     [ "$en" -lt 15 ] && echo "SLEEPING" && return
     [ "$en" -lt 30 ] && [ "$hour" -gt 22 ] && echo "SLEEPY" && return
   fi
-  [ "$se" -lt 25 ] && echo "ANXIOUS" && return
+  # Serenity-dependent mood: skip when git state tracking disabled
+  [ "$sa" -eq 1 ] && [ "$se" -lt 25 ] && echo "ANXIOUS" && return
   [ "$re" -lt 25 ] && echo "CONCERNED" && return
   [ "$bo" -lt 20 ] && echo "LONELY" && return
   # Vitality-dependent mood: skip when vitality source unavailable
@@ -63,7 +64,7 @@ mood_personality() {
 
 # --- Temporal modifiers ---
 temporal_modifier() {
-  local en=$1 se=$2 re=$3 bo=$4 vi=$5 ea=${6:-1} va=${7:-1}
+  local en=$1 se=$2 re=$3 bo=$4 vi=$5 ea=${6:-1} va=${7:-1} sa=${8:-1}
 
-  echo "$en $se $re $bo $vi $ea $va"
+  echo "$en $se $re $bo $vi $ea $va $sa"
 }

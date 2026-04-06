@@ -20,6 +20,15 @@ struct MoodAnimationConfig {
 
     static func config(for mood: String) -> MoodAnimationConfig {
         switch mood.uppercased() {
+        case "PETTING":
+            return .init(bounceAmplitude: 2.5, bounceFrequency: 2.0, rotationAmplitude: 0.06, rotationFrequency: 2.5,
+                         scaleAmplitude: 0.03, scaleFrequency: 3.5,
+                         particles: [
+                            ("❤️", 5, .up, 9, 1.2, -0.5, 18, nil),
+                            ("❤️", 4, .spiral, 7, 1.5, -0.4, 16, nil),
+                            ("❤️", 3, .float, 5, 2.0, -0.5, 14, nil),
+                            ("❤️", 3, .up, 8, 1.3, -0.55, 16, nil),
+                         ])
         case "ECSTATIC":
             return .init(bounceAmplitude: 4.0, bounceFrequency: 3.5, rotationAmplitude: 0.1, rotationFrequency: 4.0,
                          scaleAmplitude: 0.05, scaleFrequency: 6.0,
@@ -120,7 +129,10 @@ struct AnimatedMascotView: View {
     let size: CGFloat
 
     @State private var tick = Date()
+    @State private var isPetting = false
+    @State private var mouseDownTime: Date? = nil
     private let timer = Timer.publish(every: 1.0 / 15, on: .main, in: .common).autoconnect()
+    private let holdDuration: TimeInterval = 1.5
 
     init(mood: String, mascotImage: NSImage? = NSImage(named: "MascotColor"), size: CGFloat = 64) {
         self.mood = mood
@@ -130,10 +142,12 @@ struct AnimatedMascotView: View {
 
     var body: some View {
         let time = tick.timeIntervalSinceReferenceDate
-        let config = MoodAnimationConfig.config(for: mood)
+        let activeMood = isPetting ? "PETTING" : mood
+        let config = MoodAnimationConfig.config(for: activeMood)
         let scale = size / 64.0
         let bounce = config.bounceAmplitude * scale * sin(time * config.bounceFrequency * .pi * 2)
         let rotation = config.rotationAmplitude * sin(time * config.rotationFrequency * .pi * 2)
+        let petJiggle = isPetting ? 0.075 * sin(time * 6) : 0.0
         let pulse = 1.0 + config.scaleAmplitude * sin(time * config.scaleFrequency * .pi * 2)
 
         ZStack {
@@ -142,9 +156,9 @@ struct AnimatedMascotView: View {
                     .interpolation(.none)
                     .resizable()
                     .frame(width: size, height: size)
-                    .scaleEffect(pulse)
+                    .scaleEffect(isPetting ? pulse * 1.075 : pulse)
                     .offset(y: bounce)
-                    .rotationEffect(.radians(rotation))
+                    .rotationEffect(.radians(rotation + petJiggle))
             } else {
                 Image(systemName: "hare")
                     .font(.system(size: size * 0.6))
@@ -163,7 +177,23 @@ struct AnimatedMascotView: View {
             }
         }
         .frame(width: size * 2.0, height: size * 1.8)
-        .onReceive(timer) { tick = $0 }
+        .contentShape(Rectangle())
+        .overlay(
+            PetDetector(mouseDownTime: $mouseDownTime)
+                .frame(width: size, height: size)
+        )
+        .onReceive(timer) { now in
+            tick = now
+            if let down = mouseDownTime {
+                // Mouse is held — trigger petting after hold duration
+                if !isPetting && now.timeIntervalSince(down) >= holdDuration {
+                    isPetting = true
+                }
+            } else if isPetting {
+                // Mouse released — linger for 2 seconds then stop
+                isPetting = false
+            }
+        }
     }
 
     private func particleView(index i: Int, groupSeed: Double, symbol: String,
@@ -975,13 +1005,14 @@ private struct StatsSection: View {
                     EnergyDetail(details: d)
                 }
             }
-            StatRow(label: "Serenity", value: snapshot.stats.serenity, color: .teal,
-                    info: "Reflects how tidy the repo is.",
-                    disabled: snapshot.details?.serenity?.inGitRepo == false,
-                    isExpanded: expandedStat == "Serenity",
-                    onTap: { toggleStat("Serenity") }) {
-                if let d = snapshot.details?.serenity {
-                    SerenityDetail(details: d)
+            if snapshot.details?.serenity?.inGitRepo != false {
+                StatRow(label: "Serenity", value: snapshot.stats.serenity, color: .teal,
+                        info: "Reflects how tidy the repo is.",
+                        isExpanded: expandedStat == "Serenity",
+                        onTap: { toggleStat("Serenity") }) {
+                    if let d = snapshot.details?.serenity {
+                        SerenityDetail(details: d)
+                    }
                 }
             }
             StatRow(label: "Rest", value: snapshot.stats.rest, color: .mint,
@@ -1542,6 +1573,14 @@ final class ConfigManager: ObservableObject {
     @Published var telegramEnabled: Bool = true
     @Published var telegramTestResult: String?
 
+    // Toast notification settings
+    @Published var toastMessageMode: String = "ai"       // "ai" | "random"
+    @Published var toastCooldownSeconds: Double = 0       // 0 = no cooldown
+    @Published var toastVoiceVolume: Double = 0.15        // 0.0–1.0
+    @Published var toastVoiceMuted: Bool = false
+    @Published var toastMoodInfluence: Bool = true
+    @Published var gitStateEnabled: Bool = true
+
     private let configWatchQueue = DispatchQueue(label: "app.claude.mascot.configwatch", qos: .utility)
     private var configFileSource: DispatchSourceFileSystemObject?
     private var configDirSource: DispatchSourceFileSystemObject?
@@ -1567,17 +1606,27 @@ final class ConfigManager: ObservableObject {
             return
         }
         do {
-            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let paths = json["repoRoots"] as? [String] {
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 let fm = FileManager.default
-                let roots = paths.map { p in
-                    RepoRootInfo(
-                        path: p,
-                        hasClaudeDir: fm.fileExists(atPath: p + "/.claude"),
-                        isGitRepo: fm.fileExists(atPath: p + "/.git")
-                    )
+                if let paths = json["repoRoots"] as? [String] {
+                    let roots = paths.map { p in
+                        RepoRootInfo(
+                            path: p,
+                            hasClaudeDir: fm.fileExists(atPath: p + "/.claude"),
+                            isGitRepo: fm.fileExists(atPath: p + "/.git")
+                        )
+                    }
+                    DispatchQueue.main.async { self.repoRoots = roots }
                 }
-                DispatchQueue.main.async { self.repoRoots = roots }
+                // Toast settings
+                DispatchQueue.main.async {
+                    if let mode = json["toastMessageMode"] as? String { self.toastMessageMode = mode }
+                    if let cd = json["toastCooldownSeconds"] as? Double { self.toastCooldownSeconds = cd }
+                    if let vol = json["toastVoiceVolume"] as? Double { self.toastVoiceVolume = vol }
+                    if let muted = json["toastVoiceMuted"] as? Bool { self.toastVoiceMuted = muted }
+                    if let mood = json["toastMoodInfluence"] as? Bool { self.toastMoodInfluence = mood }
+                    if let git = json["gitStateEnabled"] as? Bool { self.gitStateEnabled = git }
+                }
             }
         } catch {
             DispatchQueue.main.async { self.repoRoots = [] }
@@ -1619,6 +1668,33 @@ final class ConfigManager: ObservableObject {
             try? newData.write(to: MascotPaths.configFile)
         }
         loadConfig()
+    }
+
+    // MARK: - Toast settings persistence
+
+    func saveConfig() {
+        let configPath = MascotPaths.configFile.path
+        let fm = FileManager.default
+        var config: [String: Any] = [:]
+        if let data = fm.contents(atPath: configPath),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            config = json
+        }
+        if config["version"] == nil { config["version"] = 1 }
+        // Preserve repoRoots
+        if config["repoRoots"] == nil { config["repoRoots"] = repoRoots.map { $0.path } }
+        // Write toast settings
+        config["toastMessageMode"] = toastMessageMode
+        config["toastCooldownSeconds"] = toastCooldownSeconds
+        config["toastVoiceVolume"] = toastVoiceVolume
+        config["toastVoiceMuted"] = toastVoiceMuted
+        config["toastMoodInfluence"] = toastMoodInfluence
+        config["gitStateEnabled"] = gitStateEnabled
+
+        try? fm.createDirectory(at: MascotPaths.stateDirectory, withIntermediateDirectories: true)
+        if let data = try? JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys]) {
+            try? data.write(to: MascotPaths.configFile)
+        }
     }
 
     // MARK: - Telegram .env management
@@ -1771,6 +1847,66 @@ final class ConfigManager: ObservableObject {
     }
 }
 
+// MARK: - Pet Detector (NSView for reliable mouse tracking in MenuBarExtra)
+
+struct PetDetector: NSViewRepresentable {
+    @Binding var mouseDownTime: Date?
+
+    func makeNSView(context: Context) -> PetDetectorView {
+        let view = PetDetectorView()
+        view.onMouseDown = { mouseDownTime = Date() }
+        view.onMouseUp = { mouseDownTime = nil }
+        return view
+    }
+
+    func updateNSView(_ nsView: PetDetectorView, context: Context) {}
+
+    class PetDetectorView: NSView {
+        var onMouseDown: (() -> Void)?
+        var onMouseUp: (() -> Void)?
+
+        override var acceptsFirstResponder: Bool { true }
+
+        override func mouseDown(with event: NSEvent) {
+            onMouseDown?()
+        }
+
+        override func mouseUp(with event: NSEvent) {
+            onMouseUp?()
+        }
+
+        override func mouseDragged(with event: NSEvent) {
+            // Keep holding active during drag
+        }
+    }
+}
+
+// MARK: - Info Button
+
+struct InfoButton: View {
+    let text: String
+    @State private var isShowing = false
+
+    var body: some View {
+        Image(systemName: "questionmark.circle")
+            .font(.caption2)
+            .foregroundColor(.secondary)
+            .onHover { hovering in
+                isShowing = hovering
+            }
+            .onTapGesture {
+                isShowing.toggle()
+            }
+            .popover(isPresented: $isShowing, arrowEdge: .trailing) {
+                Text(text)
+                    .font(.caption)
+                    .padding(8)
+                    .frame(width: 200)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+    }
+}
+
 // MARK: - Settings Window
 
 struct SettingsView: View {
@@ -1778,57 +1914,160 @@ struct SettingsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("GitHub Repo Roots")
-                .font(.subheadline)
-                .foregroundColor(.secondary)
+            // MARK: - Git State
+            HStack {
+                Toggle("Git state tracking", isOn: Binding(
+                    get: { configManager.gitStateEnabled },
+                    set: { configManager.gitStateEnabled = $0; configManager.saveConfig() }
+                ))
+                .font(.footnote)
+                infoButton("Tracks repo tidiness (uncommitted changes, untracked files) to influence Singe's serenity stat.")
+            }
 
-            if configManager.repoRoots.isEmpty {
-                Text("No repo roots configured.")
-                    .font(.footnote)
-                    .foregroundColor(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .center)
-                    .padding(.vertical, 20)
-            } else {
-                ScrollView {
+            if configManager.gitStateEnabled {
+                // MARK: - Repo Roots
+                HStack {
+                    Text("Repo Roots")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Button(action: openFolderPicker) {
+                        Image(systemName: "plus")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                if configManager.repoRoots.isEmpty {
+                    Text("No repo roots configured.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.vertical, 8)
+                } else {
                     VStack(spacing: 0) {
-                        ForEach(configManager.repoRoots) { root in
+                        ForEach(Array(configManager.repoRoots.enumerated()), id: \.element.id) { index, root in
                             HStack {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(root.tildeAbbreviated)
-                                        .font(.system(.body, design: .monospaced))
-                                        .lineLimit(1)
-                                        .truncationMode(.middle)
-                                    HStack(spacing: 8) {
-                                        Label(root.hasClaudeDir ? ".claude" : ".claude", systemImage: root.hasClaudeDir ? "checkmark.circle.fill" : "xmark.circle")
-                                            .font(.caption2)
-                                            .foregroundColor(root.hasClaudeDir ? .green : .secondary)
-                                        Label(root.isGitRepo ? "git" : "git", systemImage: root.isGitRepo ? "checkmark.circle.fill" : "xmark.circle")
-                                            .font(.caption2)
-                                            .foregroundColor(root.isGitRepo ? .green : .secondary)
-                                    }
-                                }
+                                Text(root.tildeAbbreviated)
+                                    .font(.system(.footnote, design: .monospaced))
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
                                 Spacer()
                                 Button(action: {
                                     configManager.removeRepoRoot(path: root.path)
                                 }) {
                                     Image(systemName: "xmark.circle.fill")
+                                        .font(.caption)
                                         .foregroundColor(.secondary)
                                 }
                                 .buttonStyle(.plain)
                             }
-                            .padding(.vertical, 6)
-                            Divider()
+                            .padding(.vertical, 4)
+                            if index < configManager.repoRoots.count - 1 {
+                                Divider()
+                            }
                         }
                     }
                 }
-                .frame(maxHeight: 200)
             }
 
+            Divider()
+                .padding(.vertical, 4)
+
+            // MARK: - Toast Notifications
+            Text("Toast Notifications")
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+
+            // Message style
             HStack {
-                Button(action: openFolderPicker) {
-                    Label("Add Repo Root", systemImage: "plus")
-                }
+                Text("Message Style")
+                    .font(.footnote)
+                infoButton(configManager.toastMessageMode == "ai"
+                    ? "AI: Claude writes a context-aware quip each time (uses one API call)."
+                    : "Random: picks from 25 pre-written quips per event — no API call.")
                 Spacer()
+            }
+            Picker("", selection: Binding(
+                get: { configManager.toastMessageMode },
+                set: { configManager.toastMessageMode = $0; configManager.saveConfig() }
+            )) {
+                Text("AI Generated").tag("ai")
+                Text("Random").tag("random")
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+
+            if configManager.toastMessageMode == "ai" {
+                HStack {
+                    Toggle("Mood influence", isOn: Binding(
+                        get: { configManager.toastMoodInfluence },
+                        set: { configManager.toastMoodInfluence = $0; configManager.saveConfig() }
+                    ))
+                    .font(.footnote)
+                    infoButton("When on, Singe's current mood (happy, anxious, tired…) shapes the AI message tone. Off = mood-neutral quips.")
+                }
+            }
+
+            // Cooldown
+            HStack {
+                Text("Cooldown")
+                    .font(.footnote)
+                infoButton("Minimum seconds between toast appearances. Prevents spam during rapid-fire sessions. 0 = no cooldown.")
+                Spacer()
+                TextField("0", text: Binding(
+                    get: {
+                        configManager.toastCooldownSeconds == 0
+                            ? "0"
+                            : String(configManager.toastCooldownSeconds)
+                    },
+                    set: {
+                        configManager.toastCooldownSeconds = Double($0) ?? 0
+                        configManager.saveConfig()
+                    }
+                ))
+                .textFieldStyle(.roundedBorder)
+                .font(.system(.footnote, design: .monospaced))
+                .frame(width: 60)
+                .multilineTextAlignment(.trailing)
+                Text("sec")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            // Voice volume
+            HStack {
+                Text("Volume")
+                    .font(.footnote)
+                infoButton("Controls the volume of Singe's voice lines. Click the speaker icon to mute/unmute.")
+                Spacer()
+            }
+            HStack(spacing: 8) {
+                Button(action: {
+                    configManager.toastVoiceMuted.toggle()
+                    configManager.saveConfig()
+                }) {
+                    Image(systemName: configManager.toastVoiceMuted
+                          ? "speaker.slash.fill"
+                          : configManager.toastVoiceVolume < 0.01 ? "speaker.fill"
+                          : configManager.toastVoiceVolume < 0.4 ? "speaker.wave.1.fill"
+                          : configManager.toastVoiceVolume < 0.7 ? "speaker.wave.2.fill"
+                          : "speaker.wave.3.fill")
+                        .foregroundColor(configManager.toastVoiceMuted ? .secondary : .primary)
+                        .frame(width: 16)
+                }
+                .buttonStyle(.plain)
+                .help(configManager.toastVoiceMuted ? "Unmute" : "Mute")
+                Slider(value: Binding(
+                    get: { configManager.toastVoiceVolume },
+                    set: { configManager.toastVoiceVolume = $0; configManager.saveConfig() }
+                ), in: 0...1, step: 0.01)
+                .disabled(configManager.toastVoiceMuted)
+                Text("\(Int(configManager.toastVoiceVolume * 100))%")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .frame(width: 32, alignment: .trailing)
             }
 
             Divider()
@@ -1842,53 +2081,58 @@ struct SettingsView: View {
             Toggle("Enable notifications", isOn: $configManager.telegramEnabled)
                 .font(.footnote)
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Bot Token")
-                    .font(.caption)
+            if configManager.telegramEnabled {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Bot Token")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    SecureField("Paste bot token from @BotFather", text: $configManager.telegramBotToken)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.footnote)
+
+                    Text("Chat ID")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    TextField("Numeric chat ID", text: $configManager.telegramChatId)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.footnote)
+                }
+
+                HStack {
+                    Button("Save") {
+                        configManager.saveEnv()
+                    }
+                    Button("Test") {
+                        configManager.saveEnv()
+                        configManager.testTelegram()
+                    }
+                    if let result = configManager.telegramTestResult {
+                        Text(result)
+                            .font(.caption2)
+                            .foregroundColor(result == "Sent!" ? .green : .secondary)
+                    }
+                    Spacer()
+                }
+
+                DisclosureGroup("Setup instructions") {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("1. Open Telegram, find @BotFather")
+                        Text("2. Send /newbot, copy the token")
+                        Text("3. Start a chat with your bot")
+                        Text("4. Get your chat ID: message @userinfobot")
+                        Text("   It will reply with your numeric ID")
+                        Text("5. Paste token + chat ID above, Save & Test")
+                    }
+                    .font(.caption2)
                     .foregroundColor(.secondary)
-                SecureField("Paste bot token from @BotFather", text: $configManager.telegramBotToken)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.footnote)
-
-                Text("Chat ID")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                TextField("Numeric chat ID", text: $configManager.telegramChatId)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.footnote)
+                }
+                .font(.footnote)
             }
-
-            HStack {
-                Button("Save") {
-                    configManager.saveEnv()
-                }
-                Button("Test") {
-                    configManager.saveEnv()
-                    configManager.testTelegram()
-                }
-                if let result = configManager.telegramTestResult {
-                    Text(result)
-                        .font(.caption2)
-                        .foregroundColor(result == "Sent!" ? .green : .secondary)
-                }
-                Spacer()
-            }
-
-            DisclosureGroup("Setup instructions") {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("1. Open Telegram, find @BotFather")
-                    Text("2. Send /newbot, copy the token")
-                    Text("3. Start a chat with your bot")
-                    Text("4. Get your chat ID:")
-                    Text("   curl \"https://api.telegram.org/bot<TOKEN>/getUpdates\"")
-                        .font(.system(.caption2, design: .monospaced))
-                    Text("5. Paste token + chat ID above, Save & Test")
-                }
-                .font(.caption2)
-                .foregroundColor(.secondary)
-            }
-            .font(.footnote)
         }
+    }
+
+    private func infoButton(_ tooltip: String) -> some View {
+        InfoButton(text: tooltip)
     }
 
     private func openFolderPicker() {
