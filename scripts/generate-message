@@ -1,0 +1,103 @@
+#!/bin/bash
+# Generate a toast message — either AI-generated or random based on config
+#
+# Usage: generate-message --mode done|permission --mood MOOD --personality "..." \
+#                         [--user-req "..."] [--asst-context "..."]
+# Output: message text on stdout
+
+set -euo pipefail
+
+MODE="done"
+MOOD="NEUTRAL"
+PERSONALITY=""
+USER_REQ=""
+ASST_CONTEXT=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --mode) MODE="$2"; shift 2 ;;
+    --mood) MOOD="$2"; shift 2 ;;
+    --personality) PERSONALITY="$2"; shift 2 ;;
+    --user-req) USER_REQ="$2"; shift 2 ;;
+    --asst-context) ASST_CONTEXT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CFG="$HOME/.config/claude-mascot/config.json"
+
+# Read message mode from config (default: ai)
+MSG_MODE="ai"
+if [ -f "$CFG" ]; then
+  _mode=$(perl -ne 'print "$1" if /"toastMessageMode"\s*:\s*"([^"]+)"/' "$CFG")
+  [ -n "$_mode" ] && MSG_MODE="$_mode"
+fi
+
+# Read mood influence setting (default: true)
+MOOD_INFLUENCE=true
+if [ -f "$CFG" ]; then
+  _mi=$(perl -ne 'print "$1" if /"toastMoodInfluence"\s*:\s*(true|false)/' "$CFG")
+  [ -n "$_mi" ] && MOOD_INFLUENCE="$_mi"
+fi
+
+if [ "$MSG_MODE" = "random" ]; then
+  # Pick a random message from the pre-written pool
+  MESSAGES_FILE="$SCRIPT_DIR/../data/random-messages.json"
+  if [ -f "$MESSAGES_FILE" ]; then
+    # Use perl to extract the array for this mode and pick a random entry
+    MSG=$(perl -0777 -e '
+      use JSON::PP;
+      my $data = decode_json(do { local $/; <STDIN> });
+      my $key = $ARGV[0] eq "permission" ? "permission" : "done";
+      my @msgs = @{$data->{$key} // []};
+      if (@msgs) { print $msgs[int(rand(scalar @msgs))]; }
+      else { print "Beep boop!"; }
+    ' "$MODE" < "$MESSAGES_FILE" 2>/dev/null)
+    # Fallback if perl/JSON fails
+    if [ -z "$MSG" ]; then
+      MSG=$(perl -0777 -ne '
+        my $key = "'"$MODE"'";
+        if (/"'$MODE'"\s*:\s*\[(.*?)\]/s) {
+          my @m = ($1 =~ /"([^"]+)"/g);
+          print $m[int(rand(scalar @m))] if @m;
+        }
+      ' "$MESSAGES_FILE")
+    fi
+    [ -n "$MSG" ] && echo "$MSG" && exit 0
+  fi
+  # Final fallback
+  if [ "$MODE" = "permission" ]; then
+    echo "Beep boop, need permission!"
+  else
+    echo "Beep boop, task complete!"
+  fi
+else
+  # AI-generated message via claude -p
+  if [ "$MODE" = "permission" ]; then
+    PROMPT="You are a funny little robot mascot. ${PERSONALITY:-You are quirky.}"
+    if [ "$MOOD_INFLUENCE" = "true" ]; then
+      PROMPT="$PROMPT Your mood is $MOOD."
+    fi
+    PROMPT="$PROMPT You need permission for: \"${USER_REQ:-something}\". Rephrase what you need to a short, funny, quirky sentence. Make it context dependent. 7-10 words. Output ONLY the sentence."
+  else
+    PROMPT="You are a funny little robot mascot. ${PERSONALITY:-You are quirky.}"
+    if [ "$MOOD_INFLUENCE" = "true" ]; then
+      PROMPT="$PROMPT Your mood is $MOOD."
+    fi
+    PROMPT="$PROMPT The user asked: \"${USER_REQ:-something}\". You responded: \"${ASST_CONTEXT:-done}\". Rephrase what you did to a short, funny, quirky sentence. Make it context dependent. 7-10 words. Output ONLY the sentence."
+  fi
+
+  TMPF=$(mktemp)
+  CLAUDE_CODE_HOOK=1 claude -p --output-format text "$PROMPT" > "$TMPF" 2>/dev/null || true
+  if [ -s "$TMPF" ]; then
+    cat "$TMPF"
+  else
+    if [ "$MODE" = "permission" ]; then
+      echo "Beep boop, need permission!"
+    else
+      echo "Beep boop, task complete!"
+    fi
+  fi
+  rm -f "$TMPF"
+fi

@@ -325,14 +325,16 @@ SAD:       { speed: 550, amplitude: 0.12, bob: 3, sway: 2, tilt: 2, filter: 'sat
   function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
   // --- Web Audio API analyser for real volume ---
-  let audioCtx, analyser, freqData;
+  let audioCtx, analyser, freqData, gainNode;
   try {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     analyser = audioCtx.createAnalyser();
     analyser.fftSize = 256;
     analyser.smoothingTimeConstant = 0.6;
     freqData = new Uint8Array(analyser.frequencyBinCount);
-    analyser.connect(audioCtx.destination);
+    gainNode = audioCtx.createGain();
+    analyser.connect(gainNode);
+    gainNode.connect(audioCtx.destination);
   } catch(e) {}
 
   function getVolume() {
@@ -352,6 +354,7 @@ SAD:       { speed: 550, amplitude: 0.12, bob: 3, sway: 2, tilt: 2, filter: 'sat
       audio.volume = globalVolume;
       if (audioCtx) {
         try {
+          if (gainNode) gainNode.gain.value = globalVolume;
           const src = audioCtx.createMediaElementSource(audio);
           src.connect(analyser);
         } catch(e) {}

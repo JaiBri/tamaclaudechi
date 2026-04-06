@@ -8,7 +8,7 @@
 MODE="done"
 MOOD="NEUTRAL"
 ACHIEVEMENT=""
-VOLUME="0.15"
+VOLUME=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --mode) MODE="$2"; shift 2 ;;
@@ -18,6 +18,20 @@ while [ $# -gt 0 ]; do
     *) break ;;
   esac
 done
+
+# Read volume from config if not passed via flag
+if [ -z "$VOLUME" ]; then
+  _CFG="$HOME/.config/claude-mascot/config.json"
+  if [ -f "$_CFG" ]; then
+    _muted=$(perl -ne 'print "$1" if /"toastVoiceMuted"\s*:\s*(true|false)/' "$_CFG")
+    if [ "$_muted" = "true" ]; then
+      VOLUME="0"
+    else
+      VOLUME=$(perl -ne 'print "$1" if /"toastVoiceVolume"\s*:\s*([0-9.]+)/' "$_CFG")
+    fi
+  fi
+  VOLUME="${VOLUME:-0.15}"
+fi
 
 MSG="${1:-Hello}"
 DURATION="${2:-3}"
