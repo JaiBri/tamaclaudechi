@@ -10,18 +10,22 @@
 # Install: add to ~/.claude/settings.json (user-level):
 #   "statusLine": { "type": "command", "command": "/path/to/mascot/scripts/statusline" }
 # ──────────────────────────────────────────────────────────────
-set -euo pipefail
+set -uo pipefail
 
 CONTEXT_DIR="${HOME}/.config/claude-mascot"
-CONTEXT_FILE="${CONTEXT_DIR}/context.json"
 
 # Read JSON from stdin
 INPUT=$(cat)
 
-# Extract fields using perl (matching tamagotchi script pattern — no jq dependency)
-remaining=$(echo "$INPUT" | perl -ne 'print $1 if /"remaining_percentage"\s*:\s*(-?[0-9.]+)/' || echo "")
-used=$(echo "$INPUT" | perl -ne 'print $1 if /"used_percentage"\s*:\s*(-?[0-9.]+)/' || echo "")
-session_id=$(echo "$INPUT" | perl -ne 'print $1 if /"session_id"\s*:\s*"([^"]*)"/' || echo "")
+# Extract fields with one perl invocation (matching tamagotchi script pattern — no jq dependency)
+eval "$(printf '%s' "$INPUT" | perl -e '
+  local $/; my $j = <STDIN>;
+  my ($r) = $j =~ /"remaining_percentage"\s*:\s*(-?[0-9.]+)/;
+  my ($u) = $j =~ /"used_percentage"\s*:\s*(-?[0-9.]+)/;
+  my ($s) = $j =~ /"session_id"\s*:\s*"([^"]*)"/;
+  printf "remaining=%s\nused=%s\nsession_id=%s\n",
+    ($r // ""), ($u // ""), ($s // "");
+')"
 
 # If we couldn't extract any context data at all (no context_window in input), pass through silently.
 # Note: remaining/used being empty just means null JSON values (start of session) — that is valid.
@@ -39,10 +43,7 @@ used=${used:-0}
 remaining=$(printf '%.0f' "$remaining")
 used=$(printf '%.0f' "$used")
 
-# Timestamp
-updated_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-# Ensure directory exists
+# Ensure directory exists (used by toast cooldown, baseline cleanup, scraper trigger)
 mkdir -p "$CONTEXT_DIR"
 
 # ANSI color codes (ANSI-C quoting so escapes are real bytes)
@@ -111,89 +112,69 @@ _session_files_count=0
 _session_files_names=""
 session_files_section
 
-# Write context file atomically (write to temp, then move)
-tmp_file=$(mktemp "${CONTEXT_DIR}/.context.XXXXXX")
-cat > "$tmp_file" <<ENDJSON
-{
-  "remaining": ${remaining},
-  "used": ${used},
-  "session_id": "${session_id}",
-  "updated_at": "${updated_at}",
-  "git": {
-    "branch": "${_git_branch}",
-    "ahead": ${_git_ahead},
-    "behind": ${_git_behind},
-    "staged": ${_git_staged},
-    "unstaged": ${_git_unstaged},
-    "untracked": ${_git_untracked},
-    "conflicts": ${_git_conflicts},
-    "stash": ${_git_stash},
-    "diff_add": ${_git_diff_add},
-    "diff_del": ${_git_diff_del},
-    "branches": ${_git_branches},
-    "unmerged": ${_git_unmerged},
-    "operation": "${_git_operation}",
-    "worktree_count": ${_git_worktree_count},
-    "worktree_name": $([ -n "$_git_worktree_name" ] && echo "\"$_git_worktree_name\"" || echo null)
-  },
-  "usage": {
-    "session_pct": ${_usage_session_pct:-null},
-    "session_elapsed_pct": ${_usage_session_elapsed:-null},
-    "session_resets": $([ -n "$_usage_session_resets" ] && echo "\"$_usage_session_resets\"" || echo null),
-    "week_all_pct": ${_usage_week_pct:-null},
-    "week_all_elapsed_pct": ${_usage_week_elapsed:-null},
-    "week_all_resets": $([ -n "$_usage_week_resets" ] && echo "\"$_usage_week_resets\"" || echo null),
-    "extra_spent": ${_usage_extra_spent:-null},
-    "extra_budget": ${_usage_extra_budget:-null},
-    "session_pace_delta": ${_usage_session_pace_delta:-null},
-    "week_pace_delta": ${_usage_week_pace_delta:-null},
-    "scraped_at": $([ -n "$_usage_scraped_at" ] && echo "\"$_usage_scraped_at\"" || echo null)
-  },
-  "session_files": {
-    "count": ${_session_files_count},
-    "names": $([ -n "$_session_files_names" ] && echo "\"$_session_files_names\"" || echo null)
-  },
-  "system": {
-    "cpu_pct": ${_system_cpu},
-    "ram_pct": ${_system_ram},
-    "disk_pct": ${_system_disk},
-    "gpu_pct": $([ "$_system_gpu" != "null" ] && [ -n "$_system_gpu" ] && echo "$_system_gpu" || echo null),
-    "swap_pct": ${_system_swap_pct},
-    "swap_used_gb": ${_system_swap},
-    "alerts": $(if [ -n "$_system_alerts" ]; then echo "$_system_alerts" | perl -e '$l=<STDIN>;chomp $l;my @a=split/,/,$l;print "[".join(",",map{"\"$_\""}@a)."]"'; else echo "[]"; fi),
-    "top_cpu_process": $([ -n "$_system_top_cpu" ] && echo "\"$_system_top_cpu\"" || echo null),
-    "top_ram_process": $([ -n "$_system_top_ram" ] && echo "\"$_system_top_ram\"" || echo null)
-  }
-}
-ENDJSON
-mv -f "$tmp_file" "$CONTEXT_FILE"
+# Sidecar context.json removed: nothing reads its content. Frontend chat module reads
+# cli-sessions.json via webhookService; the menu bar reads usage.json directly.
 
 # OSC 8 hyperlink wrappers
 LINK_ON="${ESC}]8;;"    # followed by URL then LINK_SEP
 LINK_SEP="${ESC}\\"     # ends the URL, label text follows
 LINK_OFF="${ESC}]8;;${ESC}\\"  # closes the hyperlink
 
-# Check if Vite dev server is running on port 5173
-if lsof -i :5173 -sTCP:LISTEN >/dev/null 2>&1; then
+# Service status (vite + cloudflared) — cached for 5s to keep render fast.
+# session_id-keyed per docs: PID would change every invocation and defeat the cache.
+SVC_CACHE="/tmp/statusline-services-${session_id:-default}"
+SVC_TTL=5
+svc_age=$(( $(date +%s) - $(stat -f %m "$SVC_CACHE" 2>/dev/null || echo 0) ))
+
+if [ "$svc_age" -lt "$SVC_TTL" ] && [ -f "$SVC_CACHE" ]; then
+  . "$SVC_CACHE"
+else
+  VITE_UP=0; CF_UP=0
+  lsof -i :5173 -sTCP:LISTEN >/dev/null 2>&1 && VITE_UP=1
+  pgrep -qf "cloudflared tunnel" >/dev/null 2>&1 && CF_UP=1
+  TUNNEL_URL=""
+  [ -f "${SVC_CACHE}.url" ] && TUNNEL_URL=$(cat "${SVC_CACHE}.url")
+  printf 'VITE_UP=%s\nCF_UP=%s\nTUNNEL_URL=%s\n' \
+    "$VITE_UP" "$CF_UP" "$TUNNEL_URL" > "$SVC_CACHE"
+fi
+
+# Refresh tunnel hostname out-of-band (was the worst offender: a synchronous curl on the render path).
+url_age=$(( $(date +%s) - $(stat -f %m "${SVC_CACHE}.url" 2>/dev/null || echo 0) ))
+if [ "${CF_UP:-0}" = "1" ] && [ "$url_age" -gt 30 ]; then
+  (
+    port=$(lsof -i -sTCP:LISTEN -P 2>/dev/null \
+      | awk '/cloudflared/{ match($0,/:[0-9]+/); print substr($0,RSTART+1,RLENGTH-1); exit }')
+    [ -n "$port" ] && curl -sm 1 "http://127.0.0.1:${port}/quicktunnel" 2>/dev/null \
+      | perl -ne 'print $1 if /"hostname"\s*:\s*"([^"]*)"/' \
+      > "${SVC_CACHE}.url.tmp" && mv -f "${SVC_CACHE}.url.tmp" "${SVC_CACHE}.url"
+  ) & disown
+fi
+
+# Render dev indicator
+if [ "${VITE_UP:-0}" = "1" ]; then
   vite="${LINK_ON}http://localhost:5173${LINK_SEP}${GREEN}● dev${RESET}${LINK_OFF}"
 else
   vite="${RED}○${DIM} dev${RESET}"
 fi
 
-# Check if cloudflared tunnel is running — grab tunnel URL if available
-if pgrep -qf "cloudflared tunnel"; then
-  TUNNEL_URL=""
-  metrics_port=$(lsof -i -sTCP:LISTEN -P 2>/dev/null | grep cloudflared | grep -oE ':[0-9]+' | head -1 | tr -d ':' || true)
-  if [ -n "$metrics_port" ]; then
-    TUNNEL_URL=$(curl -s "http://127.0.0.1:${metrics_port}/quicktunnel" 2>/dev/null | perl -ne 'print $1 if /"hostname"\s*:\s*"([^"]*)"/' || true)
-  fi
-  if [ -n "$TUNNEL_URL" ]; then
+# Render tunnel indicator
+if [ "${CF_UP:-0}" = "1" ]; then
+  if [ -n "${TUNNEL_URL:-}" ]; then
     cf="${LINK_ON}https://${TUNNEL_URL}${LINK_SEP}${GREEN}● tunnel${RESET}${LINK_OFF}"
   else
     cf="${GREEN}● tunnel${RESET}"
   fi
 else
   cf="${RED}○${DIM} tunnel${RESET}"
+fi
+
+# Render mempalace memory-save indicator. Sentinel file ~/.mempalace/disabled
+# toggles the Stop-hook save behaviour. Off-state is loud (red) so it's obvious
+# that auto-checkpointing is paused; on-state matches dev/tunnel green-dot style.
+if [ -f "$HOME/.mempalace/disabled" ]; then
+  mem="${RED}○${DIM} mem${RESET}"
+else
+  mem="${GREEN}● mem${RESET}"
 fi
 
 # Output status line for Claude Code's terminal
@@ -208,7 +189,7 @@ else
   brain="🧠 ${remaining}%"
 fi
 
-# ── Topic-based output (max 3 lines) ────────────────────────
+# ── Single-line output ───────────────────────────────────────
 join_and_emit() {
   local line="" s=""
   for part in "$@"; do
@@ -218,23 +199,14 @@ join_and_emit() {
   [ -n "$line" ] && echo "$line"
 }
 
-# Line 1: context & services
-line1_parts=("${brain}")
-[ -n "$usage" ] && line1_parts+=("${usage}")
-line1_parts+=("${vite}" "${cf}")
+# Single line: context, services, git, system health
+all_parts=("${brain}")
+[ -n "$usage" ] && all_parts+=("${usage}")
+all_parts+=("${vite}" "${cf}" "${mem}")
+[ -n "$git" ] && all_parts+=("${git}")
+[ -n "$system" ] && all_parts+=("${system}")
 
-# Line 2: code state
-line2_parts=()
-[ -n "$git" ] && line2_parts+=("${git}")
-[ -n "$session_files" ] && line2_parts+=("${session_files}")
-
-# Line 3: health (only when alerts fire)
-line3_parts=()
-[ -n "$system" ] && line3_parts+=("${system}")
-
-join_and_emit "${line1_parts[@]}"
-[ "${#line2_parts[@]}" -gt 0 ] && join_and_emit "${line2_parts[@]}"
-[ "${#line3_parts[@]}" -gt 0 ] && join_and_emit "${line3_parts[@]}"
+join_and_emit "${all_parts[@]}"
 
 # ── Background usage scraper trigger ─────────────────────────
 # Spawn scraper if cache is stale (>5 min) or missing
@@ -312,3 +284,7 @@ fi
 # ── Stale baseline cleanup ───────────────────────────────────
 # Remove session baselines older than 24h (background, fire-and-forget)
 find "$CONTEXT_DIR" -name '.session-baseline-*' -mtime +1 -delete 2>/dev/null &
+
+# Belt-and-braces: never propagate a non-zero exit from a trailing background fork.
+# A renderer that exits non-zero blanks the bar (per Claude Code statusline docs).
+exit 0

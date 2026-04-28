@@ -12,6 +12,8 @@ MOOD="NEUTRAL"
 PERSONALITY=""
 USER_REQ=""
 ASST_CONTEXT=""
+SESSION_ID=""
+TAMA_JSON=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -20,6 +22,8 @@ while [ $# -gt 0 ]; do
     --personality) PERSONALITY="$2"; shift 2 ;;
     --user-req) USER_REQ="$2"; shift 2 ;;
     --asst-context) ASST_CONTEXT="$2"; shift 2 ;;
+    --session-id) SESSION_ID="$2"; shift 2 ;;
+    --tama-json) TAMA_JSON="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
@@ -40,6 +44,28 @@ if [ -f "$CFG" ]; then
   _mi=$(perl -ne 'print "$1" if /"toastMoodInfluence"\s*:\s*(true|false)/' "$CFG")
   [ -n "$_mi" ] && MOOD_INFLUENCE="$_mi"
 fi
+
+# Troubleshooting log — writes one JSONL line per call
+_log_call() {
+  local source="$1" prompt="$2" response="$3"
+  local LOG_DIR="$HOME/.config/claude-mascot/logs"
+  mkdir -p "$LOG_DIR"
+  local LOG_FILE="$LOG_DIR/generate-message.jsonl"
+  local _src _pr _rs _ur _ac _si _pe _tj
+  _src=$(printf '%s' "$source" | jq -Rs .)
+  _pr=$(printf '%s' "$prompt" | jq -Rs .)
+  _rs=$(printf '%s' "$response" | jq -Rs .)
+  _ur=$(printf '%s' "$USER_REQ" | jq -Rs .)
+  _ac=$(printf '%s' "$ASST_CONTEXT" | jq -Rs .)
+  _si=$(printf '%s' "$SESSION_ID" | jq -Rs .)
+  _pe=$(printf '%s' "$PERSONALITY" | jq -Rs .)
+  _tj=$(printf '%s' "$TAMA_JSON" | jq -Rs .)
+  printf '{"ts":"%s","session_id":%s,"mode":"%s","source":%s,"msg_mode":"%s","mood":"%s","mood_influence":%s,"personality":%s,"user_req":%s,"asst_context":%s,"prompt":%s,"response":%s,"tama_state":%s}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$_si" "$MODE" "$_src" "$MSG_MODE" "$MOOD" "$MOOD_INFLUENCE" "$_pe" "$_ur" "$_ac" "$_pr" "$_rs" "$_tj" \
+    >> "$LOG_FILE"
+  # Keep last 200 entries
+  tail -200 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
+}
 
 if [ "$MSG_MODE" = "random" ]; then
   # Pick a random message from the pre-written pool
@@ -64,14 +90,20 @@ if [ "$MSG_MODE" = "random" ]; then
         }
       ' "$MESSAGES_FILE")
     fi
-    [ -n "$MSG" ] && echo "$MSG" && exit 0
+    if [ -n "$MSG" ]; then
+      _log_call "random" "" "$MSG"
+      echo "$MSG"
+      exit 0
+    fi
   fi
   # Final fallback
   if [ "$MODE" = "permission" ]; then
-    echo "Beep boop, need permission!"
+    MSG="Beep boop, need permission!"
   else
-    echo "Beep boop, task complete!"
+    MSG="Beep boop, task complete!"
   fi
+  _log_call "random-fallback" "" "$MSG"
+  echo "$MSG"
 else
   # AI-generated message via claude -p
   if [ "$MODE" = "permission" ]; then
@@ -90,14 +122,23 @@ else
 
   TMPF=$(mktemp)
   CLAUDE_CODE_HOOK=1 claude -p --output-format text "$PROMPT" > "$TMPF" 2>/dev/null || true
+
+  RESPONSE=""
   if [ -s "$TMPF" ]; then
-    cat "$TMPF"
-  else
-    if [ "$MODE" = "permission" ]; then
-      echo "Beep boop, need permission!"
-    else
-      echo "Beep boop, task complete!"
-    fi
+    RESPONSE=$(cat "$TMPF")
   fi
   rm -f "$TMPF"
+
+  if [ -n "$RESPONSE" ]; then
+    _log_call "ai" "$PROMPT" "$RESPONSE"
+    echo "$RESPONSE"
+  else
+    if [ "$MODE" = "permission" ]; then
+      MSG="Beep boop, need permission!"
+    else
+      MSG="Beep boop, task complete!"
+    fi
+    _log_call "ai-fallback" "$PROMPT" "$MSG"
+    echo "$MSG"
+  fi
 fi
