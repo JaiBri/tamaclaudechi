@@ -15,8 +15,6 @@ description: "Canonical file list with locations and purposes"
 | `scripts/commands/diagnose.sh` | Diagnostic checks (hooks, state, logs, data sources) |
 | `scripts/toast` | macOS WebView toast + queue controller |
 | `scripts/toast-assets/` | Extracted toast HTML template and Swift WebView controller |
-| `scripts/statusline` | Claude Code status line bridge (context %, usage, git) |
-| `scripts/statusline-sections/` | Extracted statusline section renderers (git, usage, system, session) |
 | `scripts/usage-scraper` | tmux-based `/usage` scraper for API plan metrics |
 | `scripts/system-monitor` | macOS system resource collector (CPU/RAM/disk/GPU) |
 | `assets/voices/` | Toast audio assets |
@@ -26,7 +24,7 @@ description: "Canonical file list with locations and purposes"
 | `menubar/build-app.sh` | Builds `TamaclaudechiMenuBar.app` bundle |
 | `menubar/install-login-item.sh` | Adds/removes login item |
 | `docs/` | Obsidian-style vault (Architecture, Design, Instructions, Reference) |
-| `install.sh` | Wires hooks + statusline into a Claude Code project |
+| `install.sh` | Wires hooks into a Claude Code project |
 
 ---
 

@@ -25,8 +25,7 @@ Options:
 
 What it does:
   1. Adds Stop + Notification hooks to <project>/.claude/settings.json
-  2. Configures the status line in ~/.claude/settings.json
-  3. Validates prerequisites (claude, jq, tmux)
+  2. Validates prerequisites (claude, jq, tmux)
 HELP
     exit 0 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
@@ -64,7 +63,7 @@ fi
 if command -v tmux >/dev/null 2>&1; then
   ok "tmux found (usage tracking enabled)"
 else
-  warn "tmux not found — usage tracking in status line will be disabled"
+  warn "tmux not found — usage tracking will be disabled"
   warn "Install with: brew install tmux"
 fi
 
@@ -129,26 +128,6 @@ jq --arg stop_cmd "$STOP_HOOK" --arg notif_cmd "$NOTIF_HOOK" '
 ' "$SETTINGS_FILE" > "$TEMP" && mv "$TEMP" "$SETTINGS_FILE"
 
 ok "Hooks installed in $SETTINGS_FILE"
-
-# ── Install status line ────────────────────────────────────────
-echo ""
-echo "Configuring status line..."
-
-USER_SETTINGS_DIR="$HOME/.claude"
-USER_SETTINGS="$USER_SETTINGS_DIR/settings.json"
-
-mkdir -p "$USER_SETTINGS_DIR"
-
-if [ ! -f "$USER_SETTINGS" ]; then
-  echo '{}' > "$USER_SETTINGS"
-fi
-
-TEMP=$(mktemp)
-jq --arg cmd "$TAMA_DIR/scripts/statusline" '
-  .statusLine = {"type": "command", "command": $cmd}
-' "$USER_SETTINGS" > "$TEMP" && mv "$TEMP" "$USER_SETTINGS"
-
-ok "Status line configured in $USER_SETTINGS"
 
 # ── Done ───────────────────────────────────────────────────────
 echo ""

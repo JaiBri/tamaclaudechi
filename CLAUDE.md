@@ -8,8 +8,7 @@ Tamaclaudechi — a living coding companion for Claude Code. A pixel-art mascot 
 
 - **State engine** (`scripts/tamagotchi` + `scripts/lib/`, `scripts/core/`, `scripts/commands/`) — Modular Bash CLI managing 5 stats, mood cascades, achievements, decay, and JSON output. Thin router sources shared helpers, engine logic, and command implementations. All state mutations flow through this.
 - **Toast overlay** (`scripts/toast` + `scripts/toast-assets/`) — macOS WebView toast with mood-aware visuals, particles, and speech bubbles. HTML template and Swift controller extracted to `toast-assets/`.
-- **Status line** (`scripts/statusline` + `scripts/statusline-sections/`) — Bridges Claude Code context metrics + API usage into the menu bar. Section renderers extracted to `statusline-sections/`.
-- **Usage scraper** (`scripts/usage-scraper`) — Background tmux session that polls `/usage` from Claude Code.
+- **Usage scraper** (`scripts/usage-scraper`) — Background tmux session that polls `/usage` from Claude Code; feeds the menu bar's session % display.
 - **System monitor** (`scripts/system-monitor`) — macOS resource collector (CPU/RAM/disk/GPU).
 - **Menu bar app** (`menubar/`) — SwiftUI companion that shows live stats, activity strip, and quick actions.
 
@@ -25,9 +24,6 @@ Tamaclaudechi — a living coding companion for Claude Code. A pixel-art mascot 
 # Menu bar
 cd menubar && swift run                  # Debug build + launch
 pkill -f TamaclaudechiMenuBar; cd menubar && bash build-app.sh && open build/TamaclaudechiMenuBar.app
-
-# Status line test
-echo '{"context_window":{"remaining_percentage":72,"used_percentage":28},"session_id":"test"}' | ./scripts/statusline
 ```
 
 ## Key Constraints
@@ -46,6 +42,5 @@ Full vault at `docs/` — start with `docs/CLAUDE-START-HERE.md`. Key docs:
 | Changing stats or moods | `docs/Design/Mascot Design System.md` |
 | Changing the CLI | `docs/Instructions/Tamagotchi CLI.md` |
 | Changing the menu bar app | `docs/Instructions/Menu Bar Companion.md` |
-| Changing the status line | `docs/Instructions/Status Line.md` |
 | Understanding the pipeline | `docs/Architecture/System Overview.md` |
 | Finding files | `docs/Reference/Key Files.md` |

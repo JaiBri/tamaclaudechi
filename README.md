@@ -22,7 +22,6 @@ cd tamaclaudechi
 
 The install script will:
 - Wire hooks into your project's `.claude/settings.json`
-- Configure the status line in your user-level `~/.claude/settings.json`
 - Validate prerequisites
 
 ### Prerequisites
@@ -30,7 +29,7 @@ The install script will:
 - **macOS** (toast + menu bar are macOS-native)
 - **Claude Code CLI** (`claude` command available in PATH)
 - **jq** (`brew install jq`) — optional but recommended
-- **tmux** (`brew install tmux`) — optional, enables API usage tracking in the status line
+- **tmux** (`brew install tmux`) — optional, enables API usage tracking in the menu bar
 
 ## Manual Setup
 
@@ -81,19 +80,6 @@ Replace `/absolute/path/to/tamaclaudechi` with the actual path to your clone.
 }
 ```
 </details>
-
-### Status Line
-
-Add to your **user-level** `~/.claude/settings.json`:
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "/absolute/path/to/tamaclaudechi/scripts/statusline"
-  }
-}
-```
 
 ## Stats
 
@@ -158,15 +144,25 @@ scripts/core/            Engine logic (state, decay, events, mood, serenity)
 scripts/commands/        CLI commands (update, status, reset, pet, config, usage)
 scripts/toast            WebView toast overlay — wrapper
 scripts/toast-assets/    HTML template + Swift WebView controller
-scripts/statusline       Status line bridge — main script
-scripts/statusline-sections/  Section renderers (git, usage, system, session)
-scripts/usage-scraper    tmux-based /usage scraper
+scripts/usage-scraper    tmux-based /usage scraper (feeds menu bar)
+scripts/usage-daemon     usage-scraper supervisor + Telegram on session reset
 scripts/system-monitor   macOS system resource collector
 menubar/                 SwiftUI menu bar companion
 assets/claude.png        Pixel art sprite
 assets/voices/           Toast audio cues
 docs/                    Project vault
-install.sh               Hook + statusline installer
+install.sh               Hook installer
+```
+
+## Uninstall
+
+```bash
+# 1. Remove the Stop + Notification hooks from your project's .claude/settings.json
+#    (look for the entries containing "TAMA_DIR=" and delete them)
+# 2. Quit the menu bar
+osascript -e 'quit app "TamaclaudechiMenuBar"'
+# 3. Delete state
+rm -rf ~/.config/claude-mascot
 ```
 
 ## Docs
