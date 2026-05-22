@@ -117,8 +117,26 @@ Native SwiftUI menu bar app showing live stats, streaks, activity history, and q
 cd menubar
 swift run                                 # Debug build
 ./build-app.sh [~/Applications/TMC.app]   # Build .app bundle
-./install-login-item.sh [/path/to/app]    # Add to Login Items
 ```
+
+### Autostart
+
+The menu bar app's **Settings** panel (gear icon in the dropdown) has a
+**Start at Login** checkbox. Toggling it on installs a launchd LaunchAgent
+(`~/Library/LaunchAgents/com.jannik.tamaclaudechi.plist`)
+that relaunches the app at login (`RunAtLoad`) and after a crash (`KeepAlive`).
+Because `KeepAlive` is on, **turning the checkbox off is the only way to stop
+the pet** — it unloads the agent and quits the app.
+
+```bash
+./scripts/autostart on      # install + load the LaunchAgent, launch the app now
+./scripts/autostart off     # unload + remove the agent (also quits the app)
+./scripts/autostart status  # prints "on" or "off"
+```
+
+The in-app checkbox calls `scripts/autostart`; the script also works standalone.
+(`menubar/install-login-item.sh` is the older Login-Items approach — superseded
+by autostart, which additionally recovers from crashes.)
 
 ## Achievements
 
@@ -147,6 +165,7 @@ scripts/toast-assets/    HTML template + Swift WebView controller
 scripts/usage-scraper    tmux-based /usage scraper (feeds menu bar)
 scripts/usage-daemon     usage-scraper supervisor + Telegram on session reset
 scripts/system-monitor   macOS system resource collector
+scripts/autostart        Menu bar app launchd autostart (on/off/status)
 menubar/                 SwiftUI menu bar companion
 assets/claude.png        Pixel art sprite
 assets/voices/           Toast audio cues

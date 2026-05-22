@@ -251,6 +251,16 @@ struct TamaclaudechiMenuBarApp: App {
     @StateObject private var configManager = ConfigManager()
 
     init() {
+        // Single-instance guard: terminate any older copy of this app so a
+        // transient double-launch (launchd starting one while a manual launch
+        // lingers) never leaves two menu bar icons. Newest wins.
+        let me = NSRunningApplication.current
+        for other in NSWorkspace.shared.runningApplications
+        where other.bundleIdentifier == me.bundleIdentifier
+            && other.processIdentifier != me.processIdentifier {
+            other.forceTerminate()
+        }
+
         // SPM executables don't populate Bundle.main.resourcePath correctly.
         // Resolve from executable → ../Resources/
         if let execURL = Bundle.main.executableURL {
@@ -306,6 +316,7 @@ final class MascotViewModel: ObservableObject {
     @Published private(set) var sessionUsage: Int? = nil
     @Published private(set) var sessionResetsIn: String? = nil
     @Published private(set) var isDaemonRunning: Bool = false
+    @Published private(set) var autostartEnabled: Bool = false
 
     private var sessionResetDate: Date?
     private var originalTemplateImage: NSImage?
@@ -357,6 +368,9 @@ final class MascotViewModel: ObservableObject {
         if !isDaemonRunning {
             startDaemon()
         }
+
+        // Reflect the current launchd autostart state in the toggle.
+        refreshAutostartStatus()
     }
 
     deinit {
@@ -575,6 +589,49 @@ final class MascotViewModel: ObservableObject {
         }
         if !alive {
             try? FileManager.default.removeItem(atPath: pidPath)
+        }
+    }
+
+    // MARK: - Autostart (launchd LaunchAgent)
+
+    /// Run `scripts/autostart <arg>` synchronously, returning trimmed stdout.
+    private func runAutostart(_ argument: String) -> String? {
+        let scriptPath = MascotPaths.autostartScript()
+        guard FileManager.default.isExecutableFile(atPath: scriptPath) else { return nil }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [scriptPath, argument]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return nil
+        }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Query whether the launchd LaunchAgent is installed + loaded.
+    func refreshAutostartStatus() {
+        Task.detached(priority: .background) {
+            let enabled = self.runAutostart("status")?.hasPrefix("on") ?? false
+            DispatchQueue.main.async { self.autostartEnabled = enabled }
+        }
+    }
+
+    /// Enable or disable autostart. With KeepAlive on, disabling also quits
+    /// this app (launchctl bootout terminates the launchd-managed process),
+    /// and enabling from a manual launch hands the lifecycle to launchd.
+    func setAutostart(_ enabled: Bool) {
+        autostartEnabled = enabled  // optimistic — the checkbox responds at once
+        Task.detached(priority: .userInitiated) {
+            _ = self.runAutostart(enabled ? "on" : "off")
+            self.refreshAutostartStatus()
         }
     }
 
@@ -889,7 +946,7 @@ struct MascotView: View {
                 }
                 .padding(.bottom, 12)
 
-                SettingsView(configManager: configManager)
+                SettingsView(viewModel: viewModel, configManager: configManager)
             }
             .padding(16)
             .frame(width: 320)
@@ -1540,6 +1597,10 @@ struct MascotPaths {
     static func daemonExecutable() -> String {
         repoRoot().appendingPathComponent("scripts/usage-daemon").path
     }
+
+    static func autostartScript() -> String {
+        repoRoot().appendingPathComponent("scripts/autostart").path
+    }
 }
 
 // MARK: - Config Manager
@@ -1910,10 +1971,24 @@ struct InfoButton: View {
 // MARK: - Settings Window
 
 struct SettingsView: View {
+    @ObservedObject var viewModel: MascotViewModel
     @ObservedObject var configManager: ConfigManager
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            // MARK: - Startup
+            HStack {
+                Toggle("Start at Login", isOn: Binding(
+                    get: { viewModel.autostartEnabled },
+                    set: { viewModel.setAutostart($0) }
+                ))
+                .font(.footnote)
+                infoButton("Relaunches Tamaclaudechi at login and if it crashes. Turning this off quits the pet.")
+            }
+
+            Divider()
+                .padding(.vertical, 4)
+
             // MARK: - Git State
             HStack {
                 Toggle("Git state tracking", isOn: Binding(

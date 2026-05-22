@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# autostart — manage the Tamaclaudechi menu bar app as a launchd LaunchAgent.
+#
+# Usage: autostart {on|off|status}
+#
+#   on      Install + load the LaunchAgent. The menu bar app launches now,
+#           relaunches at login (RunAtLoad) and after a crash (KeepAlive).
+#   off     Unload + remove the LaunchAgent. This also quits the running app.
+#   status  Print "on" or "off" (first token is machine-parseable).
+#
+# The "Start at Login" toggle inside the menu bar app calls this script.
+# Because KeepAlive is true, `off` is the only real way to stop the pet.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
+
+LABEL="com.jannik.tamaclaudechi"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+APP_PATH="$REPO_DIR/menubar/build/TamaclaudechiMenuBar.app"
+BIN="$APP_PATH/Contents/MacOS/TamaclaudechiMenuBar"
+LOG_DIR="$HOME/.config/claude-mascot/logs"
+GUI_DOMAIN="gui/$(id -u)"
+# Matches only the bundled binary, never this script or a build process.
+PROC_PATTERN='TamaclaudechiMenuBar.app/Contents/MacOS/TamaclaudechiMenuBar'
+
+# True (exit 0) when the LaunchAgent job is loaded in the GUI domain.
+is_loaded() {
+  launchctl print "$GUI_DOMAIN/$LABEL" >/dev/null 2>&1
+}
+
+# Drop the legacy Login Item created by menubar/install-login-item.sh, so
+# launchd is the single launch path (avoids a double menu bar icon).
+remove_login_item() {
+  osascript -e \
+    'tell application "System Events" to if login item "Tamaclaudechi Menu Bar" exists then delete login item "Tamaclaudechi Menu Bar"' \
+    >/dev/null 2>&1 || true
+}
+
+cmd_status() {
+  if [ -f "$PLIST" ] && is_loaded; then
+    echo "on"
+  else
+    echo "off"
+  fi
+}
+
+cmd_on() {
+  # 1. Ensure the app bundle exists (build it if a clone is fresh).
+  if [ ! -d "$APP_PATH" ]; then
+    echo "Building menu bar app..."
+    "$REPO_DIR/menubar/build-app.sh" "$APP_PATH" >/dev/null
+  fi
+  if [ ! -x "$BIN" ]; then
+    echo "❌ App binary not found at $BIN" >&2
+    exit 1
+  fi
+
+  # 2. Prepare log + LaunchAgents directories.
+  mkdir -p "$LOG_DIR" "$(dirname "$PLIST")"
+
+  # 3. Write the LaunchAgent plist. ProgramArguments points at the binary
+  #    inside the bundle (NOT `open <app>`): launchd must be the direct
+  #    parent for KeepAlive crash-recovery to work.
+  cat > "$PLIST" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$BIN</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>StandardOutPath</key>
+  <string>$LOG_DIR/menubar.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>$LOG_DIR/menubar.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>$HOME</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+</dict>
+</plist>
+PLIST_EOF
+
+  # 4. Reload cleanly: bootout a stale job + kill any manually-launched
+  #    instance, so exactly one launchd-managed instance ends up running.
+  if is_loaded; then
+    launchctl bootout "$GUI_DOMAIN/$LABEL" >/dev/null 2>&1 || true
+  fi
+  pkill -f "$PROC_PATTERN" >/dev/null 2>&1 || true
+  sleep 1
+
+  # 5. Bootstrap — RunAtLoad launches the app immediately.
+  launchctl bootstrap "$GUI_DOMAIN" "$PLIST"
+
+  # 6. Remove the legacy Login Item path.
+  remove_login_item
+
+  echo "✅ Autostart enabled — Tamaclaudechi launches at login and restarts if it crashes."
+}
+
+cmd_off() {
+  # bootout stops KeepAlive and terminates the running app.
+  if is_loaded; then
+    launchctl bootout "$GUI_DOMAIN/$LABEL" >/dev/null 2>&1 || true
+  fi
+  rm -f "$PLIST"
+  echo "✅ Autostart disabled — Tamaclaudechi will not relaunch."
+}
+
+case "${1:-status}" in
+  on)     cmd_on ;;
+  off)    cmd_off ;;
+  status) cmd_status ;;
+  *)
+    echo "Usage: autostart {on|off|status}" >&2
+    exit 1
+    ;;
+esac

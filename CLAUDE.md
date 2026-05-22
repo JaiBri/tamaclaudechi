@@ -24,6 +24,7 @@ Tamaclaudechi — a living coding companion for Claude Code. A pixel-art mascot 
 # Menu bar
 cd menubar && swift run                  # Debug build + launch
 pkill -f TamaclaudechiMenuBar; cd menubar && bash build-app.sh && open build/TamaclaudechiMenuBar.app
+./scripts/autostart {on|off|status}      # launchd autostart (RunAtLoad + KeepAlive); backs the in-app "Start at Login" toggle
 ```
 
 ## Key Constraints
